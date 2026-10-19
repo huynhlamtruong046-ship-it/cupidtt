@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>CupidGo - Hẹn Hò & Kết Đôi</title>
+    <meta name="description" content="Ứng dụng hẹn hò thế hệ mới: Khám phá đối tượng tương thích, vuốt ghép đôi thông minh, trò chuyện realtime và kết nối chân ái." />
+    <meta property="og:title" content="CupidGo - Hẹn Hò & Kết Đôi" />
+    <meta property="og:description" content="Ứng dụng hẹn hò thế hệ mới: Khám phá đối tượng tương thích, vuốt ghép đôi thông minh, trò chuyện realtime và kết nối chân ái." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="theme-color" content="#ff4458" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="CupidGo" />
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Playfair+Display:ital,wght@0,600;0,700;1,600&display=swap" rel="stylesheet">
+    <script>
+      (function() {
+        // Suppress Vite HMR WebSocket closing warning in cloud preview environment
+        var originalError = console.error;
+        console.error = function() {
+          var msg = arguments[0];
+          if (typeof msg === 'string' && (msg.indexOf('[vite]') !== -1 || msg.indexOf('WebSocket') !== -1)) {
+            return;
+          }
+          originalError.apply(console, arguments);
+        };
+
+        // Stub vite-hmr websocket if invoked in iframe
+        if (typeof window !== 'undefined' && window.WebSocket) {
+          var RealWebSocket = window.WebSocket;
+          window.WebSocket = function(url, protocols) {
+            if (typeof url === 'string' && (url.indexOf('vite-hmr') !== -1 || protocols === 'vite-hmr')) {
+              var listeners = {};
+              var stub = {
+                readyState: 1,
+                send: function() {},
+                close: function() {},
+                addEventListener: function(evt, fn) {
+                  listeners[evt] = listeners[evt] || [];
+                  listeners[evt].push(fn);
+                  if (evt === 'open') {
+                    setTimeout(function() { fn({ type: 'open' }); }, 0);
+                  }
+                },
+                removeEventListener: function() {},
+                dispatchEvent: function() { return true; }
+              };
+              return stub;
+            }
+            return new RealWebSocket(url, protocols);
+          };
+          window.WebSocket.prototype = RealWebSocket.prototype;
+          window.WebSocket.CONNECTING = 0;
+          window.WebSocket.OPEN = 1;
+          window.WebSocket.CLOSING = 2;
+          window.WebSocket.CLOSED = 3;
+        }
+
+        // Global safeguard: Prevent QuotaExceededError from crashing on localStorage/sessionStorage
+        if (typeof window !== 'undefined' && window.Storage && window.Storage.prototype) {
+          var origSetItem = window.Storage.prototype.setItem;
+          window.Storage.prototype.setItem = function(key, value) {
+            try {
+              origSetItem.apply(this, arguments);
+            } catch (err) {
+              if (err && (err.name === 'QuotaExceededError' || err.code === 22 || err.number === -2147024882)) {
+                // Try clearing heavy caches
+                try {
+                  window.localStorage.removeItem('cupid_matches_v1');
+                  window.localStorage.removeItem('cupid_messages_v1');
+                  window.localStorage.removeItem('cupid_managed_profiles_v1');
+                } catch (e) {}
+                return;
+              }
+              throw err;
+            }
+          };
+        }
+      })();
+    </script>
+  </head>
+  <body class="bg-neutral-950 text-neutral-100 antialiased selection:bg-rose-500 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

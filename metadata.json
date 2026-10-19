@@ -1,0 +1,8 @@
+{
+  "name": "Remix CupidGo - Hẹn Hò \u0026 Kết Đôi",
+  "description": "Ứng dụng hẹn hò thế hệ mới: Khám phá đối tượng tương thích, vuốt ghép đôi thông minh, trò chuyện realtime và kết nối chân ái.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
