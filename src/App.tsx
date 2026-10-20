@@ -27,7 +27,7 @@ const DatingAppInner: React.FC = () => {
   } = useDating();
 
   // If in dedicated admin mode (Data Management & System Dashboard)
-  if (isAdminMode) {
+  if (isAdminMode && currentUser?.email?.trim().toLowerCase() === 'huynhlamtruong046@gmail.com') {
     return <AdminDashboard />;
   }
 

@@ -305,29 +305,31 @@ export const ProfileScreen: React.FC = () => {
               <ChevronRight className="w-4 h-4 text-neutral-500" />
             </button>
 
-            {/* Data Management & PostgreSQL Direct Access */}
-            <button
-              onClick={() => setIsAdminMode(true)}
-              className="w-full p-4 bg-neutral-900 hover:bg-neutral-850 border border-emerald-500/30 hover:border-emerald-500/60 rounded-2xl flex items-center justify-between transition-colors text-left group shadow-sm"
-            >
-              <div className="flex items-center gap-3">
-                <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400 group-hover:text-emerald-300">
-                  <Database className="w-4 h-4" />
-                </div>
-                <div>
-                  <span className="text-xs font-bold text-neutral-100 flex items-center gap-1.5">
-                    Quản lý dữ liệu (Data Management)
-                    <span className="px-1.5 py-0.2 bg-emerald-500/20 text-emerald-300 text-[9px] font-mono rounded border border-emerald-500/30">
-                      Cloud SQL PostgreSQL
+            {/* Admin-only entry (server-side requireAdmin remains the actual security boundary). */}
+            {currentUser?.email?.trim().toLowerCase() === 'huynhlamtruong046@gmail.com' && (
+              <button
+                onClick={() => setIsAdminMode(true)}
+                className="w-full p-4 bg-neutral-900 hover:bg-neutral-850 border border-emerald-500/30 hover:border-emerald-500/60 rounded-2xl flex items-center justify-between transition-colors text-left group shadow-sm"
+              >
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-xl text-emerald-400 group-hover:text-emerald-300">
+                    <Database className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold text-neutral-100 flex items-center gap-1.5">
+                      Quản lý dữ liệu (Data Management)
+                      <span className="px-1.5 py-0.2 bg-emerald-500/20 text-emerald-300 text-[9px] font-mono rounded border border-emerald-500/30">
+                        Cloud SQL PostgreSQL
+                      </span>
                     </span>
-                  </span>
-                  <span className="text-[11px] text-neutral-400">
-                    Truy xuất trực tiếp database, thống kê tài khoản, hồ sơ và kiểm duyệt
-                  </span>
+                    <span className="text-[11px] text-neutral-400">
+                      Truy xuất database, thống kê tài khoản, hồ sơ và kiểm duyệt
+                    </span>
+                  </div>
                 </div>
-              </div>
-              <ChevronRight className="w-4 h-4 text-neutral-400 group-hover:text-neutral-200 transition-colors" />
-            </button>
+                <ChevronRight className="w-4 h-4 text-neutral-400 group-hover:text-neutral-200 transition-colors" />
+              </button>
+            )}
 
             {/* Download App to Device */}
             <button

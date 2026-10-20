@@ -7,17 +7,11 @@ import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import url from 'url';
 import dotenv from 'dotenv';
-import bcryptjs from 'bcryptjs';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   seedInitialDataIfEmpty,
   getOrCreateUser,
-  getUserByEmail,
   getUserByUid,
-  createUserWithPassword,
-  updateUserVerificationOtp,
-  markUserEmailVerified,
-  incrementVerificationAttempts,
   updateUser,
   getProfileByUserId,
   upsertProfile,
@@ -44,14 +38,8 @@ import {
   getDataManagementUserDetail,
   getDatabaseConnectionHealth,
 } from './src/db/dating.ts';
-import { optionalAuth, requireAuth, requireAdmin, AuthRequest } from './src/middleware/auth.ts';
+import { requireAuth, requireAdmin, AuthRequest, ADMIN_EMAILS } from './src/middleware/auth.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
-import {
-  generateOtpCode,
-  hashOtpCode,
-  verifyOtpCode,
-  sendVerificationEmail,
-} from './src/lib/emailService.ts';
 
 dotenv.config();
 process.env.DISABLE_HMR = 'true';
@@ -67,81 +55,101 @@ async function startServer() {
   app.use(express.json({ limit: '10mb' }));
   app.use('/uploads', express.static(path.join(__dirname, 'public', 'uploads')));
 
-  // Real-time WebSocket Server for Live Chat between real users
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  // Authenticated real-time chat. The browser offers a normal subprotocol plus
+  // a Firebase ID token subprotocol; only the normal subprotocol is echoed back.
+  const wss = new WebSocketServer({
+    server,
+    path: '/ws',
+    handleProtocols: (protocols) => protocols.has('cupidgo-v1') ? 'cupidgo-v1' : false,
+  });
   const connectedUsers = new Map<string, Set<WebSocket>>();
 
-  const broadcastToUser = (targetUserId: string, payload: any) => {
+  const broadcastToUser = (targetUserId: string, payload: unknown) => {
     const clients = connectedUsers.get(targetUserId);
-    if (clients) {
-      const msgStr = JSON.stringify(payload);
-      clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(msgStr);
-        }
-      });
-    }
+    if (!clients) return;
+    const msgStr = JSON.stringify(payload);
+    clients.forEach((client) => {
+      if (client.readyState === WebSocket.OPEN) client.send(msgStr);
+    });
   };
 
   wss.on('connection', (ws, req) => {
-    const parsedUrl = url.parse(req.url || '', true);
-    const userId = (parsedUrl.query.userId as string) || '';
-    if (!userId) {
-      ws.close();
-      return;
-    }
+    const rawProtocols = req.headers['sec-websocket-protocol'];
+    const offeredProtocols = (typeof rawProtocols === 'string' ? rawProtocols : '')
+      .split(',').map((value) => value.trim()).filter(Boolean);
+    const tokenProtocol = offeredProtocols.find((value) => value.startsWith('firebase.'));
+    const token = tokenProtocol?.slice('firebase.'.length);
+    let userId: string | null = null;
 
-    if (!connectedUsers.has(userId)) {
-      connectedUsers.set(userId, new Set());
-    }
-    connectedUsers.get(userId)!.add(ws);
-
-    // Send connection established confirmation
-    ws.send(JSON.stringify({ type: 'CONNECTED', userId }));
+    const authentication = (async (): Promise<boolean> => {
+      if (!token) {
+        ws.close(1008, 'Firebase authentication required');
+        return false;
+      }
+      try {
+        const decoded = await adminAuth.verifyIdToken(token);
+        if (decoded.email_verified !== true || !decoded.uid) {
+          ws.close(1008, 'Verified email required');
+          return false;
+        }
+        if (ws.readyState !== WebSocket.OPEN) return false;
+        userId = decoded.uid;
+        if (!connectedUsers.has(userId)) connectedUsers.set(userId, new Set());
+        connectedUsers.get(userId)!.add(ws);
+        ws.send(JSON.stringify({ type: 'CONNECTED', userId }));
+        return true;
+      } catch (error) {
+        console.warn('WebSocket Firebase token verification failed:', error);
+        if (ws.readyState === WebSocket.OPEN) ws.close(1008, 'Invalid authentication');
+        return false;
+      }
+    })();
 
     ws.on('message', async (data) => {
       try {
+        if (!(await authentication) || !userId) return;
         const payload = JSON.parse(data.toString());
+        const matchId = typeof payload.matchId === 'string' ? payload.matchId : '';
+        if (!matchId) return;
+
+        const match = await getMatchById(matchId);
+        if (!match || (match.user1Id !== userId && match.user2Id !== userId)) {
+          ws.send(JSON.stringify({ type: 'ERROR', message: 'Bạn không có quyền truy cập cuộc trò chuyện này.' }));
+          return;
+        }
+        const partnerId = match.user1Id === userId ? match.user2Id : match.user1Id;
+
         if (payload.type === 'SEND_MESSAGE') {
-          const { matchId, receiverId, content, messageType, imageUrl } = payload;
-          // Verify that user is participant of the match
-          const match = await getMatchById(matchId);
-          if (!match || (match.user1Id !== userId && match.user2Id !== userId)) {
-            ws.send(JSON.stringify({ type: 'ERROR', message: 'Forbidden: You are not part of this conversation' }));
+          const content = typeof payload.content === 'string' ? payload.content : '';
+          const imageUrl = typeof payload.imageUrl === 'string' ? payload.imageUrl : undefined;
+          const messageType = payload.messageType === 'IMAGE' ? 'IMAGE' : 'TEXT';
+          if ((!content.trim() && !imageUrl) || content.length > 5000) {
+            ws.send(JSON.stringify({ type: 'ERROR', message: 'Nội dung tin nhắn không hợp lệ.' }));
             return;
           }
-
-          const sentMsg = await createMessage(matchId, userId, content || '', messageType || 'TEXT', imageUrl);
-          
-          // Confirm to sender
+          const sentMsg = await createMessage(matchId, userId, content, messageType, imageUrl);
           ws.send(JSON.stringify({ type: 'MESSAGE_SENT', message: sentMsg }));
-
-          // Broadcast in real-time to receiver if online
-          const isReceiverOnline = connectedUsers.has(receiverId) && connectedUsers.get(receiverId)!.size > 0;
-          if (isReceiverOnline) {
-            broadcastToUser(receiverId, { type: 'NEW_MESSAGE', message: { ...sentMsg, status: 'delivered' } });
-            // Notify sender of delivery
-            ws.send(JSON.stringify({ type: 'MESSAGE_DELIVERED', messageId: sentMsg.id, matchId }));
+          if (connectedUsers.has(partnerId)) {
+            broadcastToUser(partnerId, { type: 'NEW_MESSAGE', message: sentMsg });
+            broadcastToUser(userId, { type: 'MESSAGE_DELIVERED', messageId: sentMsg.id, matchId });
           }
         } else if (payload.type === 'MARK_READ') {
-          const { matchId, partnerId } = payload;
           await markMessagesAsRead(matchId, userId);
-          // Notify partner that messages are read
           broadcastToUser(partnerId, { type: 'MESSAGES_READ', matchId, readerId: userId });
         } else if (payload.type === 'TYPING' || payload.type === 'STOP_TYPING') {
-          const { receiverId, matchId } = payload;
-          broadcastToUser(receiverId, { type: payload.type, matchId, senderId: userId });
+          broadcastToUser(partnerId, { type: payload.type, matchId, senderId: userId });
         }
-      } catch (err) {
-        console.error('WS message handling error:', err);
+      } catch (error) {
+        console.error('WebSocket message handling failed:', error);
       }
     });
 
     ws.on('close', () => {
-      const set = connectedUsers.get(userId);
-      if (set) {
-        set.delete(ws);
-        if (set.size === 0) connectedUsers.delete(userId);
+      if (!userId) return;
+      const userSockets = connectedUsers.get(userId);
+      if (userSockets) {
+        userSockets.delete(ws);
+        if (userSockets.size === 0) connectedUsers.delete(userId);
       }
     });
   });
@@ -156,302 +164,37 @@ async function startServer() {
     res.json({ status: 'ok', time: new Date().toISOString() });
   });
 
-  // 1. Real Email Registration with Mandatory Verification
-  app.post('/api/auth/register', async (req, res) => {
-    try {
-      const { email, password, phoneNumber } = req.body;
-      if (!email || typeof email !== 'string') {
-        return res.status(400).json({ error: 'Vui lòng cung cấp địa chỉ email hợp lệ.' });
-      }
-      const cleanEmail = email.trim().toLowerCase();
-      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-      if (!emailRegex.test(cleanEmail)) {
-        return res.status(400).json({ error: 'Địa chỉ email không đúng định dạng.' });
-      }
-
-      if (!password || typeof password !== 'string' || password.length < 6) {
-        return res.status(400).json({ error: 'Mật khẩu phải có độ dài tối thiểu 6 ký tự.' });
-      }
-
-      // Check if user already exists in PostgreSQL
-      const existingUser = await getUserByEmail(cleanEmail);
-      if (existingUser) {
-        if (existingUser.emailVerified) {
-          return res.status(400).json({ error: 'Email này đã được đăng ký tài khoản. Vui lòng đăng nhập.' });
-        }
-        // Account exists but email is not verified: update password & send new OTP
-        const passwordHash = await bcryptjs.hash(password, 10);
-        const otpCode = generateOtpCode();
-        const otpHashed = hashOtpCode(otpCode);
-        const otpExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
-
-        await updateUser(existingUser.uid, {
-          passwordHash,
-          verificationCodeHash: otpHashed,
-          verificationCodeExpiresAt: otpExpiresAt,
-          verificationAttempts: 0,
-          lastVerificationSentAt: new Date(),
-          phoneNumber: phoneNumber || existingUser.phoneNumber,
-          updatedAt: new Date(),
-        });
-
-        await sendVerificationEmail(cleanEmail, otpCode);
-
-        return res.json({
-          success: true,
-          uid: existingUser.uid,
-          email: cleanEmail,
-          requiresVerification: true,
-          message: 'Tài khoản chưa xác minh. Mã OTP mới đã được gửi đến email của bạn.',
-        });
-      }
-
-      // Generate unique user identifier
-      const uid = `user_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-      const passwordHash = await bcryptjs.hash(password, 10);
-      const otpCode = generateOtpCode();
-      const otpHashed = hashOtpCode(otpCode);
-      const otpExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
-
-      const newUser = await createUserWithPassword(
-        uid,
-        cleanEmail,
-        passwordHash,
-        otpHashed,
-        otpExpiresAt
-      );
-
-      await sendVerificationEmail(cleanEmail, otpCode);
-
-      res.status(201).json({
-        success: true,
-        uid: newUser.uid,
-        email: cleanEmail,
-        requiresVerification: true,
-        message: 'Đăng ký thành công! Vui lòng kiểm tra email để lấy mã xác minh.',
-      });
-    } catch (error: any) {
-      console.error('Registration error:', error);
-      res.status(500).json({ error: error.message || 'Lỗi xử lý đăng ký' });
-    }
+  // Email/password account creation and verification are handled by Firebase Authentication.
+  // The old PostgreSQL-only OTP routes returned non-Firebase UIDs and could not create secure sessions.
+  const legacyAuthEndpoint = (_req: express.Request, res: express.Response) => res.status(410).json({
+    error: 'AUTH_PROVIDER_CHANGED',
+    message: 'Hãy đăng ký/đăng nhập bằng Firebase Authentication trong giao diện CupidGo.',
   });
-
-  // 2. Secure Login (Requires verified email!)
-  app.post('/api/auth/login', async (req, res) => {
-    try {
-      const { email, password } = req.body;
-      if (!email || !password) {
-        return res.status(400).json({ error: 'Vui lòng nhập đầy đủ email và mật khẩu.' });
-      }
-
-      const cleanEmail = email.trim().toLowerCase();
-      const user = await getUserByEmail(cleanEmail);
-      if (!user) {
-        return res.status(401).json({ error: 'Email hoặc mật khẩu không chính xác.' });
-      }
-
-      // Check password
-      if (user.passwordHash) {
-        const isMatch = await bcryptjs.compare(password, user.passwordHash);
-        if (!isMatch) {
-          return res.status(401).json({ error: 'Email hoặc mật khẩu không chính xác.' });
-        }
-      } else {
-        // Admin fallback check
-        if (cleanEmail !== 'huynhlamtruong046@gmail.com') {
-          return res.status(401).json({ error: 'Email hoặc mật khẩu không chính xác.' });
-        }
-      }
-
-      // Check email verification status: MANDATORY!
-      if (!user.emailVerified) {
-        return res.status(403).json({
-          error: 'EMAIL_NOT_VERIFIED',
-          message: 'Tài khoản chưa xác minh email. Vui lòng xác minh để tiếp tục sử dụng ứng dụng.',
-          uid: user.uid,
-          email: user.email,
-        });
-      }
-
-      const profile = await getProfileByUserId(user.uid);
-
-      res.json({
-        success: true,
-        token: user.uid,
-        user: {
-          id: user.uid,
-          email: user.email,
-          phoneNumber: user.phoneNumber,
-          isPremium: user.isPremium,
-          isCompleted: user.isCompleted,
-          emailVerified: user.emailVerified,
-        },
-        profile,
-      });
-    } catch (error: any) {
-      console.error('Login error:', error);
-      res.status(500).json({ error: error.message || 'Lỗi khi đăng nhập' });
-    }
-  });
-
-  // 3. Verify OTP code
-  app.post('/api/auth/verify-otp', async (req, res) => {
-    try {
-      const { email, uid, otp } = req.body;
-      if (!otp || typeof otp !== 'string' || otp.trim().length !== 6) {
-        return res.status(400).json({ error: 'Mã xác minh phải gồm đúng 6 chữ số.' });
-      }
-
-      let user = null;
-      if (uid) {
-        user = await getUserByUid(uid);
-      }
-      if (!user && email) {
-        user = await getUserByEmail(email);
-      }
-
-      if (!user) {
-        return res.status(404).json({ error: 'Không tìm thấy thông tin tài khoản.' });
-      }
-
-      if (user.emailVerified) {
-        const profile = await getProfileByUserId(user.uid);
-        return res.json({
-          success: true,
-          verified: true,
-          alreadyVerified: true,
-          message: 'Email của bạn đã được xác minh trước đó.',
-          user: {
-            id: user.uid,
-            email: user.email,
-            emailVerified: true,
-            isCompleted: user.isCompleted,
-            isPremium: user.isPremium,
-          },
-          profile,
-        });
-      }
-
-      // Anti-bruteforce check: max 5 attempts per code
-      if (user.verificationAttempts >= 5) {
-        return res.status(429).json({
-          error: 'MAX_ATTEMPTS_EXCEEDED',
-          message: 'Bạn đã nhập sai mã quá 5 lần. Vui lòng bấm "Gửi lại mã" để nhận mã xác minh mới.',
-        });
-      }
-
-      // Expiration check (15 minutes)
-      if (!user.verificationCodeExpiresAt || new Date() > new Date(user.verificationCodeExpiresAt)) {
-        return res.status(400).json({
-          error: 'CODE_EXPIRED',
-          message: 'Mã xác minh đã hết hạn (sau 15 phút). Vui lòng yêu cầu gửi lại mã mới.',
-        });
-      }
-
-      // Constant-time compare hash
-      if (!user.verificationCodeHash || !verifyOtpCode(otp, user.verificationCodeHash)) {
-        await incrementVerificationAttempts(user.uid);
-        const remaining = 5 - (user.verificationAttempts + 1);
-        return res.status(400).json({
-          error: 'INVALID_CODE',
-          message: `Mã xác minh không chính xác. Bạn còn ${Math.max(0, remaining)} lần thử.`,
-        });
-      }
-
-      // Verified successfully!
-      const updatedUser = await markUserEmailVerified(user.uid);
-      const profile = await getProfileByUserId(user.uid);
-
-      res.json({
-        success: true,
-        verified: true,
-        message: 'Xác minh email thành công!',
-        user: {
-          id: updatedUser.uid,
-          email: updatedUser.email,
-          emailVerified: true,
-          isCompleted: updatedUser.isCompleted,
-          isPremium: updatedUser.isPremium,
-        },
-        profile,
-      });
-    } catch (error: any) {
-      console.error('Verify OTP error:', error);
-      res.status(500).json({ error: error.message || 'Lỗi khi kiểm tra mã xác minh' });
-    }
-  });
-
-  // 4. Resend OTP code with 60-second anti-abuse rate limit
-  app.post('/api/auth/resend-otp', async (req, res) => {
-    try {
-      const { email, uid } = req.body;
-      let user = null;
-      if (uid) user = await getUserByUid(uid);
-      if (!user && email) user = await getUserByEmail(email);
-
-      if (!user) {
-        return res.status(404).json({ error: 'Không tìm thấy tài khoản.' });
-      }
-
-      if (user.emailVerified) {
-        return res.json({ success: true, alreadyVerified: true, message: 'Email đã được xác minh.' });
-      }
-
-      // Rate limit: 60 seconds cooldown between resends
-      if (user.lastVerificationSentAt) {
-        const timeDiff = Date.now() - new Date(user.lastVerificationSentAt).getTime();
-        if (timeDiff < 60 * 1000) {
-          const waitSeconds = Math.ceil((60 * 1000 - timeDiff) / 1000);
-          return res.status(429).json({
-            error: 'RATE_LIMITED',
-            message: `Vui lòng đợi ${waitSeconds} giây trước khi yêu cầu gửi lại mã.`,
-            waitSeconds,
-          });
-        }
-      }
-
-      const otpCode = generateOtpCode();
-      const otpHashed = hashOtpCode(otpCode);
-      const otpExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
-
-      await updateUserVerificationOtp(user.uid, otpHashed, otpExpiresAt);
-      await sendVerificationEmail(user.email, otpCode);
-
-      res.json({
-        success: true,
-        message: 'Đã gửi lại mã xác minh mới vào hộp thư email của bạn.',
-      });
-    } catch (error: any) {
-      console.error('Resend OTP error:', error);
-      res.status(500).json({ error: error.message || 'Lỗi khi gửi lại mã xác minh' });
-    }
-  });
+  app.post('/api/auth/register', legacyAuthEndpoint);
+  app.post('/api/auth/login', legacyAuthEndpoint);
+  app.post('/api/auth/verify-otp', legacyAuthEndpoint);
+  app.post('/api/auth/resend-otp', legacyAuthEndpoint);
 
   // 5. Firebase Email Link / Google Auth verification hook
-  app.post('/api/auth/verify-firebase', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/auth/verify-firebase', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const authHeader = req.headers.authorization;
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ error: 'Thiếu token xác thực' });
+      const uid = req.customUserId;
+      const email = req.user?.email?.trim().toLowerCase();
+      if (!uid || !email || req.user?.email_verified !== true) {
+        return res.status(403).json({ error: 'Email chưa được xác minh.' });
       }
-      const token = authHeader.split('Bearer ')[1];
-      const decoded = await adminAuth.verifyIdToken(token);
-      
-      if (!decoded.email_verified) {
-        return res.status(400).json({ error: 'Email chưa được xác nhận trên hệ thống.' });
-      }
-
-      await markUserEmailVerified(decoded.uid);
-      const profile = await getProfileByUserId(decoded.uid);
-      res.json({ success: true, verified: true, profile });
+      await getOrCreateUser(uid, email, req.user?.phone_number);
+      await updateUser(uid, { email, emailVerified: true, phoneNumber: req.user?.phone_number || null });
+      const profile = await getProfileByUserId(uid);
+      return res.json({ success: true, verified: true, profile });
     } catch (error: any) {
       console.error('Verify Firebase error:', error);
-      res.status(500).json({ error: error.message || 'Lỗi khi xác minh token' });
+      return res.status(500).json({ error: 'Không thể đồng bộ trạng thái xác minh.' });
     }
   });
 
   // 6. Persistent Image Upload API (Saves to server disk in /public/uploads/)
-  app.post('/api/upload', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/upload', requireAuth, async (req: AuthRequest, res) => {
     try {
       const { data, fileName } = req.body;
       if (!data || typeof data !== 'string') {
@@ -501,32 +244,33 @@ async function startServer() {
   });
 
   // 7. Auth & Sync User
-  app.post('/api/auth/sync', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/auth/sync', requireAuth, async (req: AuthRequest, res) => {
     try {
-      let uid = req.customUserId || req.body.uid;
-      const email = req.user?.email || req.body.email || `${uid}@cupidgo.vn`;
-      if (email.toLowerCase() === 'huynhlamtruong046@gmail.com') {
-        uid = 'Ak7nIqR8fpQ2eIUP3zQE790MOBH2';
+      const uid = req.customUserId;
+      const email = req.user?.email?.trim().toLowerCase();
+      if (!uid || !email || req.user?.email_verified !== true) {
+        return res.status(403).json({ error: 'Tài khoản phải xác minh email trước khi sử dụng CupidGo.' });
       }
-      if (!uid) {
-        return res.status(400).json({ error: 'uid is required' });
-      }
-      const phoneNumber = req.body.phoneNumber;
 
-      const user = await getOrCreateUser(uid, email, phoneNumber);
+      const phoneNumber = req.user?.phone_number || undefined;
+      await getOrCreateUser(uid, email, phoneNumber);
+      const user = await updateUser(uid, {
+        email,
+        emailVerified: true,
+        phoneNumber: phoneNumber || null,
+      });
       const profile = await getProfileByUserId(uid);
-
-      res.json({ user, profile });
+      return res.json({ user, profile });
     } catch (error: any) {
       console.error('Auth sync failed:', error);
-      res.status(500).json({ error: error.message || 'Auth sync failed' });
+      return res.status(500).json({ error: 'Không thể đồng bộ tài khoản với cơ sở dữ liệu.' });
     }
   });
 
   // Get current user profile
-  app.get('/api/profiles/me', optionalAuth, async (req: AuthRequest, res) => {
+  app.get('/api/profiles/me', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.customUserId || (req.query.userId as string);
+      const uid = req.customUserId;
       if (!uid) {
         return res.status(400).json({ error: 'userId is required' });
       }
@@ -539,9 +283,9 @@ async function startServer() {
   });
 
   // Save / Update profile (for real people registration or onboarding)
-  app.post('/api/profiles', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/profiles', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.customUserId || req.body.userId;
+      const uid = req.customUserId;
       if (!uid) {
         return res.status(400).json({ error: 'userId is required' });
       }
@@ -556,7 +300,24 @@ async function startServer() {
       }
 
       const profileData = req.body;
-      const savedProfile = await upsertProfile(uid, profileData);
+      if (profileData.photos !== undefined) {
+        if (!Array.isArray(profileData.photos) || profileData.photos.length > 6) {
+          return res.status(400).json({ error: 'Hồ sơ chỉ được có tối đa 6 ảnh.' });
+        }
+        for (const photo of profileData.photos) {
+          if (typeof photo !== 'string' || photo.length > 1_500_000) {
+            return res.status(400).json({ error: 'Ảnh không hợp lệ hoặc quá lớn; mỗi ảnh tối đa 1 MB.' });
+          }
+        }
+      }
+      const existingProfile = await getProfileByUserId(uid);
+      const safeProfileData = {
+        ...profileData,
+        userId: uid,
+        isVerified: existingProfile?.isVerified ?? false,
+        isBanned: existingProfile?.isBanned ?? false,
+      };
+      const savedProfile = await upsertProfile(uid, safeProfileData);
       res.json({ profile: savedProfile });
     } catch (error: any) {
       console.error('Save profile failed:', error);
@@ -565,9 +326,9 @@ async function startServer() {
   });
 
   // Discovery candidate feed (Only verified users!)
-  app.post('/api/profiles/candidates', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/profiles/candidates', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.customUserId || req.body.userId;
+      const uid = req.customUserId;
       if (!uid) {
         return res.status(400).json({ error: 'userId is required' });
       }
@@ -591,9 +352,9 @@ async function startServer() {
   });
 
   // Likes You feed
-  app.get('/api/profiles/liked-me', optionalAuth, async (req: AuthRequest, res) => {
+  app.get('/api/profiles/liked-me', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.customUserId || (req.query.userId as string);
+      const uid = req.customUserId;
       if (!uid) {
         return res.status(400).json({ error: 'userId is required' });
       }
@@ -606,12 +367,20 @@ async function startServer() {
   });
 
   // Swiping
-  app.post('/api/swipes', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/swipes', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const swiperId = req.customUserId || req.body.swiperId;
-      const { targetId, action } = req.body;
-      if (!swiperId || !targetId || !action) {
-        return res.status(400).json({ error: 'swiperId, targetId, and action are required' });
+      const swiperId = req.customUserId;
+      const { targetId, action } = req.body || {};
+      if (!swiperId || typeof targetId !== 'string' || !targetId || !['LIKE', 'PASS', 'SUPER_LIKE'].includes(action)) {
+        return res.status(400).json({ error: 'targetId or swipe action is invalid.' });
+      }
+      if (targetId === swiperId) {
+        return res.status(400).json({ error: 'Không thể vuốt hồ sơ của chính mình.' });
+      }
+      const targetUser = await getUserByUid(targetId);
+      const targetProfile = await getProfileByUserId(targetId);
+      if (!targetUser || targetUser.emailVerified !== true || !targetUser.isCompleted || !targetProfile || targetProfile.isBanned) {
+        return res.status(404).json({ error: 'Hồ sơ không tồn tại hoặc không đủ điều kiện ghép đôi.' });
       }
 
       const result = await recordSwipe(swiperId, targetId, action);
@@ -623,9 +392,9 @@ async function startServer() {
   });
 
   // Rewind swipe
-  app.post('/api/swipes/rewind', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/swipes/rewind', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const swiperId = req.customUserId || req.body.swiperId;
+      const swiperId = req.customUserId;
       if (!swiperId) {
         return res.status(400).json({ error: 'swiperId is required' });
       }
@@ -638,9 +407,9 @@ async function startServer() {
   });
 
   // Reset all swipes for current user (to rediscover real user profiles without resetting profile or account)
-  app.post('/api/swipes/reset', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/swipes/reset', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const swiperId = req.customUserId || req.body.swiperId || (req.query.userId as string);
+      const swiperId = req.customUserId;
       if (!swiperId) {
         return res.status(400).json({ error: 'swiperId is required' });
       }
@@ -653,9 +422,9 @@ async function startServer() {
   });
 
   // Matches
-  app.get('/api/matches', optionalAuth, async (req: AuthRequest, res) => {
+  app.get('/api/matches', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const uid = req.customUserId || (req.query.userId as string);
+      const uid = req.customUserId;
       if (!uid) {
         return res.status(400).json({ error: 'userId is required' });
       }
@@ -668,17 +437,17 @@ async function startServer() {
   });
 
   // Messages for a match (Authorized participants only!)
-  app.get('/api/matches/:matchId/messages', optionalAuth, async (req: AuthRequest, res) => {
+  app.get('/api/matches/:matchId/messages', requireAuth, async (req: AuthRequest, res) => {
     try {
       const { matchId } = req.params;
-      const uid = req.customUserId || (req.query.userId as string);
+      const uid = req.customUserId;
       
       const match = await getMatchById(matchId);
       if (!match) {
         return res.status(404).json({ error: 'Không tìm thấy cuộc trò chuyện' });
       }
 
-      if (uid && match.user1Id !== uid && match.user2Id !== uid) {
+      if (!uid || (match.user1Id !== uid && match.user2Id !== uid)) {
         return res.status(403).json({ error: 'Bạn không có quyền xem cuộc trò chuyện này.' });
       }
 
@@ -691,11 +460,14 @@ async function startServer() {
   });
 
   // Send message (Authorized participants only!)
-  app.post('/api/matches/:matchId/messages', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/matches/:matchId/messages', requireAuth, async (req: AuthRequest, res) => {
     try {
       const { matchId } = req.params;
-      const senderId = req.customUserId || req.body.senderId;
+      const senderId = req.customUserId;
       const { content, type, imageUrl } = req.body;
+      const safeContent = typeof content === 'string' ? content : '';
+      const safeImageUrl = typeof imageUrl === 'string' ? imageUrl : undefined;
+      const safeType = type === 'IMAGE' ? 'IMAGE' : 'TEXT';
 
       if (!senderId) {
         return res.status(400).json({ error: 'senderId is required' });
@@ -710,18 +482,19 @@ async function startServer() {
         return res.status(403).json({ error: 'Bạn không có quyền gửi tin nhắn vào cuộc trò chuyện này.' });
       }
 
-      if (!content && !imageUrl) {
-        return res.status(400).json({ error: 'Content or image is required' });
+      if ((!safeContent.trim() && !safeImageUrl) || safeContent.length > 5000) {
+        return res.status(400).json({ error: 'Nội dung tin nhắn không hợp lệ.' });
+      }
+      if (safeImageUrl && safeImageUrl.length > 1_500_000) {
+        return res.status(400).json({ error: 'Ảnh gửi trong chat vượt giới hạn 1 MB.' });
       }
 
-      const sentMsg = await createMessage(matchId, senderId, content || '', type, imageUrl);
+      const sentMsg = await createMessage(matchId, senderId, safeContent, safeType, safeImageUrl);
       
       // Real-time broadcast to recipient if online
-      const receiverId = req.body.receiverId || (match.user1Id === senderId ? match.user2Id : match.user1Id);
-      if (receiverId) {
-        broadcastToUser(receiverId, { type: 'NEW_MESSAGE', message: { ...sentMsg, status: 'delivered' } });
-        broadcastToUser(senderId, { type: 'MESSAGE_DELIVERED', messageId: sentMsg.id, matchId });
-      }
+      const receiverId = match.user1Id === senderId ? match.user2Id : match.user1Id;
+      broadcastToUser(receiverId, { type: 'NEW_MESSAGE', message: sentMsg });
+      broadcastToUser(senderId, { type: 'MESSAGE_DELIVERED', messageId: sentMsg.id, matchId });
 
       res.json({ message: sentMsg });
     } catch (error: any) {
@@ -731,21 +504,22 @@ async function startServer() {
   });
 
   // Mark messages as read
-  app.post('/api/matches/:matchId/read', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/matches/:matchId/read', requireAuth, async (req: AuthRequest, res) => {
     try {
       const { matchId } = req.params;
-      const readerId = req.customUserId || req.body.readerId;
+      const readerId = req.customUserId;
       if (!readerId) {
         return res.status(400).json({ error: 'readerId is required' });
       }
-      await markMessagesAsRead(matchId, readerId);
-
-      const partnerId = req.body.partnerId;
-      if (partnerId) {
-        broadcastToUser(partnerId, { type: 'MESSAGES_READ', matchId, readerId });
+      const match = await getMatchById(matchId);
+      if (!match) return res.status(404).json({ error: 'Không tìm thấy cuộc trò chuyện.' });
+      if (match.user1Id !== readerId && match.user2Id !== readerId) {
+        return res.status(403).json({ error: 'Bạn không có quyền truy cập cuộc trò chuyện này.' });
       }
-
-      res.json({ success: true });
+      await markMessagesAsRead(matchId, readerId);
+      const partnerId = match.user1Id === readerId ? match.user2Id : match.user1Id;
+      broadcastToUser(partnerId, { type: 'MESSAGES_READ', matchId, readerId });
+      return res.json({ success: true });
     } catch (error: any) {
       console.error('Mark read error:', error);
       res.status(500).json({ error: error.message || 'Failed to mark as read' });
@@ -753,9 +527,9 @@ async function startServer() {
   });
 
   // Reports and Block
-  app.post('/api/reports', optionalAuth, async (req: AuthRequest, res) => {
+  app.post('/api/reports', requireAuth, async (req: AuthRequest, res) => {
     try {
-      const reporterId = req.customUserId || req.body.reporterId;
+      const reporterId = req.customUserId;
       const { reportedId, type, reason } = req.body;
 
       if (!reporterId || !reportedId) {
@@ -770,32 +544,17 @@ async function startServer() {
     }
   });
 
-  // Premium upgrade
-  app.post('/api/user/premium', optionalAuth, async (req: AuthRequest, res) => {
-    try {
-      const uid = req.customUserId || req.body.userId;
-      if (!uid) {
-        return res.status(400).json({ error: 'userId is required' });
-      }
-      const { tier } = req.body;
-      const expiry = new Date();
-      expiry.setMonth(expiry.getMonth() + 1);
-
-      await updateUser(uid, {
-        isPremium: true,
-        premiumTier: tier || '1_month',
-        premiumExpiry: expiry,
-      });
-
-      res.json({ success: true, isPremium: true, tier });
-    } catch (error: any) {
-      console.error('Premium upgrade error:', error);
-      res.status(500).json({ error: error.message || 'Failed to upgrade premium' });
-    }
+  // Premium must not be granted by a client request without verified payment-provider evidence.
+  // Connect a payment provider and verify its signed webhook before enabling this endpoint.
+  app.post('/api/user/premium', requireAuth, (_req: AuthRequest, res) => {
+    return res.status(501).json({
+      error: 'PAYMENTS_NOT_CONFIGURED',
+      message: 'Thanh toán VIP chưa được tích hợp. Tài khoản chưa được nâng cấp.',
+    });
   });
 
   // Admin APIs
-  app.get('/api/admin/stats', async (_req, res) => {
+  app.get('/api/admin/stats', requireAdmin, async (_req, res) => {
     try {
       const stats = await getAdminStats();
       res.json({ stats });
@@ -804,7 +563,7 @@ async function startServer() {
     }
   });
 
-  app.get('/api/admin/profiles', async (_req, res) => {
+  app.get('/api/admin/profiles', requireAdmin, async (_req, res) => {
     try {
       const all = await getAllProfiles();
       res.json({ profiles: all });
@@ -813,7 +572,7 @@ async function startServer() {
     }
   });
 
-  app.get('/api/admin/reports', async (_req, res) => {
+  app.get('/api/admin/reports', requireAdmin, async (_req, res) => {
     try {
       const repList = await getAllReports();
       res.json({ reports: repList });
@@ -822,7 +581,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/reports/:reportId/resolve', async (req, res) => {
+  app.post('/api/admin/reports/:reportId/resolve', requireAdmin, async (req, res) => {
     try {
       const { reportId } = req.params;
       const { action } = req.body;
@@ -833,7 +592,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/users/:userId/verify', async (req, res) => {
+  app.post('/api/admin/users/:userId/verify', requireAdmin, async (req, res) => {
     try {
       const { userId } = req.params;
       const isVerified = await toggleVerifyUser(userId);
@@ -843,7 +602,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/users/:userId/ban', async (req, res) => {
+  app.post('/api/admin/users/:userId/ban', requireAdmin, async (req, res) => {
     try {
       const { userId } = req.params;
       const isBanned = await toggleBanUser(userId);
@@ -853,7 +612,7 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/users/:userId/vip', async (req, res) => {
+  app.post('/api/admin/users/:userId/vip', requireAdmin, async (req, res) => {
     try {
       const { userId } = req.params;
       const { isVip } = req.body;
@@ -864,15 +623,28 @@ async function startServer() {
     }
   });
 
-  app.post('/api/admin/profiles/new', async (req, res) => {
+  app.post('/api/admin/profiles/new', requireAdmin, async (req, res) => {
     try {
-      const profileData = req.body;
-      const uid = profileData.userId || `user_real_${Date.now()}`;
-      await getOrCreateUser(uid, `${uid}@cupidgo.vn`);
-      const profile = await upsertProfile(uid, profileData);
-      res.json({ profile });
+      const profileData = req.body || {};
+      const uid = typeof profileData.userId === 'string' ? profileData.userId.trim() : '';
+      if (!uid) {
+        return res.status(400).json({ error: 'Chỉ có thể quản lý hồ sơ của tài khoản đã đăng ký; không tạo hồ sơ giả.' });
+      }
+      const targetUser = await getUserByUid(uid);
+      if (!targetUser || targetUser.emailVerified !== true) {
+        return res.status(400).json({ error: 'Tài khoản không tồn tại hoặc chưa xác minh email.' });
+      }
+      const existingProfile = await getProfileByUserId(uid);
+      const profile = await upsertProfile(uid, {
+        ...profileData,
+        userId: uid,
+        isVerified: existingProfile?.isVerified ?? false,
+        isBanned: existingProfile?.isBanned ?? false,
+      });
+      return res.json({ profile });
     } catch (error: any) {
-      res.status(500).json({ error: error.message || 'Failed to create profile' });
+      console.error('Admin profile update failed:', error);
+      return res.status(500).json({ error: error.message || 'Failed to update profile' });
     }
   });
 
@@ -880,39 +652,16 @@ async function startServer() {
   // DATA MANAGEMENT ENDPOINTS (Cloud SQL PostgreSQL Direct)
   // -------------------------------------------------------------
 
-  // Role check: verifies if current user session has admin privileges
-  app.get('/api/admin/check-role', async (req: AuthRequest, res) => {
-    try {
-      const authHeader = req.headers.authorization;
-      const adminHeaderEmail = (req.headers['x-admin-email'] as string | undefined)?.trim().toLowerCase();
-      let email: string | undefined = undefined;
-
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.split('Bearer ')[1];
-        try {
-          const decoded = await adminAuth.verifyIdToken(token);
-          email = decoded.email?.toLowerCase();
-        } catch {
-          if (token.startsWith('admin_') || token.startsWith('dev_admin')) {
-            email = 'huynhlamtruong046@gmail.com';
-          }
-        }
-      }
-
-      if (!email && adminHeaderEmail) {
-        email = adminHeaderEmail;
-      }
-
-      const isAdmin = Boolean(email && email === 'huynhlamtruong046@gmail.com');
-      res.json({
-        isAdmin,
-        email: email || null,
-        role: isAdmin ? 'super_admin' : 'user',
-        timestamp: new Date().toISOString(),
-      });
-    } catch (error: any) {
-      res.status(500).json({ error: error.message || 'Check role error' });
-    }
+  // Role check is informational; all actual admin endpoints still use requireAdmin.
+  app.get('/api/admin/check-role', requireAuth, (req: AuthRequest, res) => {
+    const email = req.user?.email?.trim().toLowerCase() || null;
+    const isAdmin = Boolean(email && req.user?.email_verified === true && ADMIN_EMAILS.includes(email));
+    return res.json({
+      isAdmin,
+      email,
+      role: isAdmin ? 'super_admin' : 'user',
+      timestamp: new Date().toISOString(),
+    });
   });
 
   // Health & connection diagnostics

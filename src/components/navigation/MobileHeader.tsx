@@ -98,14 +98,16 @@ export const MobileHeader: React.FC = () => {
           <Download className="w-4 h-4" />
         </button>
 
-        {/* Admin / Data Management Trigger */}
-        <button
-          onClick={() => setIsAdminMode(true)}
-          title="Quản lý dữ liệu Cloud SQL PostgreSQL (Admin)"
-          className="flex items-center justify-center w-9 h-9 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 hover:text-white hover:bg-rose-500/20 transition-all active:scale-95"
-        >
-          <Database className="w-4 h-4" />
-        </button>
+        {/* This is a UI convenience only; all admin APIs are also protected server-side. */}
+        {currentUser?.email?.trim().toLowerCase() === 'huynhlamtruong046@gmail.com' && (
+          <button
+            onClick={() => setIsAdminMode(true)}
+            title="Quản lý dữ liệu Cloud SQL PostgreSQL (Admin)"
+            className="flex items-center justify-center w-9 h-9 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 hover:text-white hover:bg-rose-500/20 transition-all active:scale-95"
+          >
+            <Database className="w-4 h-4" />
+          </button>
+        )}
 
         {/* VIP Upgrade Banner trigger */}
         {!currentUser?.isPremium && (

@@ -29,6 +29,7 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
+import { auth } from '../../lib/firebase.ts';
 
 interface MetricsData {
   totalAccounts: number;
@@ -136,7 +137,7 @@ interface UserDetailData {
 }
 
 export const DataManagement: React.FC = () => {
-  const { currentUser, showToast } = useDating();
+  const { showToast } = useDating();
 
   // State
   const [metrics, setMetrics] = useState<MetricsData | null>(null);
@@ -159,18 +160,20 @@ export const DataManagement: React.FC = () => {
   // Copy feedback
   const [copiedUid, setCopiedUid] = useState<string | null>(null);
 
-  // Auth header generator
-  const getAuthHeaders = useCallback(() => {
+  // Admin APIs require a verified Firebase ID token; never impersonate admin with a client-supplied email.
+  const getAuthHeaders = useCallback(async () => {
+    const firebaseUser = auth.currentUser;
+    if (!firebaseUser) throw new Error('Bạn cần đăng nhập bằng tài khoản quản trị.');
     return {
       'Content-Type': 'application/json',
-      'x-admin-email': currentUser?.email || 'huynhlamtruong046@gmail.com',
+      Authorization: `Bearer ${await firebaseUser.getIdToken()}`,
     };
-  }, [currentUser]);
+  }, []);
 
   // Fetch metrics & health
   const fetchOverview = useCallback(async () => {
     try {
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const [healthRes, metricsRes] = await Promise.all([
         fetch('/api/admin/data-management/health', { headers }),
         fetch('/api/admin/data-management/metrics', { headers }),
@@ -207,7 +210,7 @@ export const DataManagement: React.FC = () => {
     try {
       setIsLoading(true);
       setErrorMessage(null);
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const params = new URLSearchParams({
         page: page.toString(),
         limit: '15',
@@ -264,7 +267,7 @@ export const DataManagement: React.FC = () => {
     setIsLoadingDetail(true);
     setDetailTab('profile');
     try {
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/admin/data-management/users/${uid}`, { headers });
       if (res.ok) {
         const data = await res.json();
@@ -283,7 +286,7 @@ export const DataManagement: React.FC = () => {
   // Quick Action: Toggle Ban
   const handleToggleBan = async (uid: string, currentBan: boolean) => {
     try {
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/admin/data-management/users/${uid}/toggle-ban`, {
         method: 'POST',
         headers,
@@ -309,7 +312,7 @@ export const DataManagement: React.FC = () => {
   // Quick Action: Toggle Verify
   const handleToggleVerify = async (uid: string, currentVerify: boolean) => {
     try {
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/admin/data-management/users/${uid}/toggle-verify`, {
         method: 'POST',
         headers,
@@ -334,7 +337,7 @@ export const DataManagement: React.FC = () => {
   // Quick Action: Toggle VIP
   const handleToggleVip = async (uid: string, currentVip: boolean) => {
     try {
-      const headers = getAuthHeaders();
+      const headers = await getAuthHeaders();
       const res = await fetch(`/api/admin/data-management/users/${uid}/toggle-vip`, {
         method: 'POST',
         headers,

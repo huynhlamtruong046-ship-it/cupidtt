@@ -1,5 +1,5 @@
 import React, { useState, useRef } from 'react';
-import { Camera, MapPin, Sparkles, Check, ArrowRight, ArrowLeft, Image as ImageIcon, Heart, Upload, Link as LinkIcon, Database } from 'lucide-react';
+import { Camera, MapPin, Sparkles, ArrowRight, ArrowLeft, Image as ImageIcon, Heart, Upload, Link as LinkIcon, Database } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
 import { AVAILABLE_INTERESTS, LOOKING_FOR_OPTIONS } from '../../data/mockProfiles';
 import { Gender, TargetGender } from '../../types';
@@ -11,12 +11,10 @@ export const OnboardingScreen: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Form State
-  const [photos, setPhotos] = useState<string[]>([
-    '/src/assets/images/cupid_minh_portrait_1791186060876.jpg',
-  ]);
+  const [photos, setPhotos] = useState<string[]>([]);
   const [customUrlInput, setCustomUrlInput] = useState('');
   const [displayName, setDisplayName] = useState('');
-  const [birthDate, setBirthDate] = useState('2000-01-01');
+  const [birthDate, setBirthDate] = useState('');
   const [gender, setGender] = useState<Gender>('MALE');
   const [targetGender, setTargetGender] = useState<TargetGender>('FEMALE');
   const [locationName, setLocationName] = useState('TP. Hồ Chí Minh');
@@ -30,47 +28,66 @@ export const OnboardingScreen: React.FC = () => {
   ]);
   const [lookingFor, setLookingFor] = useState<string>(LOOKING_FOR_OPTIONS[0]);
 
-  // Pre-curated photo choices for quick selection
-  const avatarChoices = [
-    '/src/assets/images/cupid_minh_portrait_1791186060876.jpg',
-    '/src/assets/images/cupid_linh_portrait_1791186047763.jpg',
-    '/src/assets/images/cupid_ha_portrait_1791186074150.jpg',
-    '/src/assets/images/cupid_tuan_portrait_1791186089711.jpg',
-    'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=800&q=80',
-    'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=800&q=80',
-  ];
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.currentTarget;
+    const file = input.files?.[0];
     if (!file) return;
-
-    if (!file.type.startsWith('image/')) {
-      showToast('Vui lòng chọn tệp hình ảnh hợp lệ (JPG, PNG, WebP)');
+    if (photos.length >= 6) {
+      showToast('Tối đa 6 ảnh trong bộ sưu tập.');
+      input.value = '';
+      return;
+    }
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp'];
+    if (!allowedTypes.includes(file.type)) {
+      showToast('Chỉ chấp nhận ảnh JPG, PNG hoặc WebP.');
+      input.value = '';
+      return;
+    }
+    if (file.size > 1024 * 1024) {
+      showToast('Mỗi ảnh phải có dung lượng tối đa 1 MB để lưu hồ sơ ổn định.');
+      input.value = '';
       return;
     }
 
     const reader = new FileReader();
     reader.onload = () => {
-      const result = reader.result as string;
-      if (photos.length >= 6) {
-        showToast('Tối đa 6 ảnh trong bộ sưu tập');
+      const result = reader.result;
+      if (typeof result !== 'string') {
+        showToast('Không đọc được ảnh. Vui lòng thử lại.');
         return;
       }
-      setPhotos((prev) => [result, ...prev]);
-      showToast('Đã tải ảnh thật của bạn thành công!');
+      setPhotos((prev) => prev.length < 6 ? [result, ...prev] : prev);
+      showToast('Đã thêm ảnh từ thiết bị.');
+      input.value = '';
+    };
+    reader.onerror = () => {
+      showToast('Không đọc được ảnh. Vui lòng thử lại.');
+      input.value = '';
     };
     reader.readAsDataURL(file);
   };
 
   const handleAddCustomUrl = () => {
-    if (!customUrlInput.trim()) return;
+    const value = customUrlInput.trim();
+    if (!value) return;
     if (photos.length >= 6) {
-      showToast('Tối đa 6 ảnh trong bộ sưu tập');
+      showToast('Tối đa 6 ảnh trong bộ sưu tập.');
       return;
     }
-    setPhotos((prev) => [...prev, customUrlInput.trim()]);
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== 'https:' || !/\.(jpe?g|png|webp)(?:$|[?#])/i.test(parsed.pathname + parsed.search + parsed.hash)) {
+        showToast('Vui lòng nhập đường dẫn ảnh HTTPS có đuôi JPG, PNG hoặc WebP.');
+        return;
+      }
+    } catch {
+      showToast('Đường dẫn ảnh không hợp lệ.');
+      return;
+    }
+    setPhotos((prev) => [...prev, value]);
     setCustomUrlInput('');
-    showToast('Đã thêm ảnh đại diện từ đường dẫn');
+    showToast('Đã thêm đường dẫn ảnh.');
   };
 
   const handleToggleInterest = (interest: string) => {
@@ -85,31 +102,21 @@ export const OnboardingScreen: React.FC = () => {
     }
   };
 
-  const handleAddPhoto = (url: string) => {
-    if (photos.includes(url)) {
-      if (photos.length === 1) {
-        showToast('Cần ít nhất 1 ảnh đại diện');
-        return;
-      }
-      setPhotos(photos.filter((p) => p !== url));
-    } else {
-      if (photos.length >= 6) {
-        showToast('Tối đa 6 ảnh trong bộ sưu tập');
-        return;
-      }
-      setPhotos([...photos, url]);
-    }
+  const handleRemovePhoto = (photo: string) => {
+    setPhotos((previous) => previous.filter((item) => item !== photo));
   };
 
   const calculateAge = (dateStr: string) => {
+    if (!dateStr) return 0;
     const birth = new Date(dateStr);
+    if (Number.isNaN(birth.getTime())) return 0;
     const today = new Date();
     let age = today.getFullYear() - birth.getFullYear();
     const m = today.getMonth() - birth.getMonth();
     if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) {
       age--;
     }
-    return Math.max(18, age);
+    return age;
   };
 
   const handleNext = () => {
@@ -126,7 +133,7 @@ export const OnboardingScreen: React.FC = () => {
       }
       const age = calculateAge(birthDate);
       if (age < 18) {
-        showToast('Bạn phải từ đủ 18 tuổi để tham gia');
+        showToast('Vui lòng nhập ngày sinh hợp lệ. Bạn phải đủ 18 tuổi để tham gia.');
         return;
       }
       setStep(3);
@@ -261,7 +268,7 @@ export const OnboardingScreen: React.FC = () => {
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            handleAddPhoto(photo);
+                            handleRemovePhoto(photo);
                           }}
                           className="absolute top-1.5 right-1.5 w-6 h-6 rounded-full bg-black/60 text-white text-xs flex items-center justify-center backdrop-blur-sm opacity-90 hover:opacity-100"
                         >
@@ -284,34 +291,9 @@ export const OnboardingScreen: React.FC = () => {
               })}
             </div>
 
-            {/* Quick avatar choices */}
-            <div className="pt-2">
-              <label className="block text-xs font-semibold text-neutral-300 mb-2">
-                Hoặc chọn nhanh từ mẫu có sẵn:
-              </label>
-              <div className="grid grid-cols-6 gap-2">
-                {avatarChoices.map((url, idx) => {
-                  const isSelected = photos.includes(url);
-                  return (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => handleAddPhoto(url)}
-                      className={`relative aspect-square rounded-xl overflow-hidden border-2 transition-all ${
-                        isSelected ? 'border-rose-500 ring-2 ring-rose-500/30' : 'border-neutral-800 hover:border-neutral-600'
-                      }`}
-                    >
-                      <img src={url} alt="Mẫu" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                      {isSelected && (
-                        <div className="absolute inset-0 bg-rose-500/30 flex items-center justify-center">
-                          <Check className="w-4 h-4 text-white drop-shadow" />
-                        </div>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+            <p className="pt-2 text-[11px] text-neutral-500">
+              Hãy tải ảnh của chính bạn. Ảnh đại diện cần là ảnh bạn có quyền sử dụng; không có hồ sơ ảnh mẫu.
+            </p>
           </div>
         )}
 
@@ -348,7 +330,8 @@ export const OnboardingScreen: React.FC = () => {
                     type="date"
                     value={birthDate}
                     onChange={(e) => setBirthDate(e.target.value)}
-                    max="2008-01-01"
+                    max={new Date(new Date().setFullYear(new Date().getFullYear() - 18)).toISOString().slice(0, 10)}
+                    required
                     className="w-full px-3 py-2.5 bg-neutral-900 border border-neutral-800 rounded-xl text-xs text-neutral-100 focus:outline-none focus:border-rose-500 transition-colors"
                   />
                 </div>

@@ -7,106 +7,92 @@ export interface AuthRequest extends Request {
   customUserId?: string;
 }
 
-export const requireAuth = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Unauthorized: Missing token' });
-  }
-
-  const token = authHeader.split('Bearer ')[1];
-  try {
-    const decodedToken = await adminAuth.verifyIdToken(token);
-    req.user = decodedToken;
-    req.customUserId = decodedToken.uid;
-    next();
-  } catch (error) {
-  
-    console.error('Error verifying Firebase ID token:', error);
-    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
-  }
-};
-
-export const optionalAuth = async (
-  req: AuthRequest,
-  _res: Response,
-  next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    const token = authHeader.split('Bearer ')[1];
-    try {
-      const decodedToken = await adminAuth.verifyIdToken(token);
-      req.user = decodedToken;
-      req.customUserId = decodedToken.uid;
-   } catch (error) {
-  console.error('Error verifying optional Firebase ID token:', error);
-  return _res.status(401).json({
-    error: 'Unauthorized: Invalid token'
-  });
+function getBearerToken(req: Request): string | null {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) return null;
+  const token = header.slice('Bearer '.length).trim();
+  return token || null;
 }
-  }
-  next();
-};
 
-export const ADMIN_EMAILS = ['huynhlamtruong046@gmail.com'];
-
-
-export const requireAdmin = async (
-  req: AuthRequest,
-  res: Response,
-  next: NextFunction
-) => {
-  const authHeader = req.headers.authorization;
-
-  // Require a Firebase ID token.
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({
-      error: 'Thiếu token xác thực hợp lệ.'
-    });
-  }
-
-  const token = authHeader.slice('Bearer '.length).trim();
-
+export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  const token = getBearerToken(req);
   if (!token) {
-    return res.status(401).json({
-      error: 'Token xác thực không hợp lệ.'
-    });
+    return res.status(401).json({ error: 'UNAUTHENTICATED', message: 'Vui lòng đăng nhập.' });
   }
 
   try {
-    // Never trust client-supplied email headers or demo token prefixes.
     const decodedToken = await adminAuth.verifyIdToken(token);
-
-    const email = decodedToken.email?.trim().toLowerCase();
-
-    // Require a verified email.
-    if (!email || decodedToken.email_verified !== true) {
+    if (!decodedToken.uid || decodedToken.email_verified !== true) {
       return res.status(403).json({
-        error: 'Tài khoản phải xác minh email trước khi truy cập.'
+        error: 'EMAIL_NOT_VERIFIED',
+        message: 'Vui lòng xác minh email trước khi sử dụng CupidGo.',
       });
     }
-
-    // Only server-configured administrator emails are allowed.
-    if (!ADMIN_EMAILS.includes(email)) {
-      return res.status(403).json({
-        error: 'Bạn không có quyền quản trị.'
-      });
-    }
-
     req.user = decodedToken;
     req.customUserId = decodedToken.uid;
-
     return next();
   } catch (error) {
-    console.error('Admin authentication failed:', error);
-
-    return res.status(401).json({
-      error: 'Token xác thực không hợp lệ hoặc đã hết hạn.'
-    });
+    console.warn('Firebase ID token verification failed:', error);
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.' });
   }
 };
 
+// Use only for genuinely public endpoints that may optionally personalize responses.
+// Requests with an Authorization header must contain a valid, verified Firebase token.
+export const optionalAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  const header = req.headers.authorization;
+  if (!header) return next();
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Authorization header không hợp lệ.' });
+  }
+
+  try {
+    const decodedToken = await adminAuth.verifyIdToken(token);
+    if (!decodedToken.uid || decodedToken.email_verified !== true) {
+      return res.status(403).json({
+        error: 'EMAIL_NOT_VERIFIED',
+        message: 'Vui lòng xác minh email trước khi sử dụng CupidGo.',
+      });
+    }
+    req.user = decodedToken;
+    req.customUserId = decodedToken.uid;
+    return next();
+  } catch (error) {
+    console.warn('Optional Firebase ID token verification failed:', error);
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Phiên đăng nhập không hợp lệ hoặc đã hết hạn.' });
+  }
+};
+
+// Configure ADMIN_EMAILS in the server environment for deployment. The default preserves
+// the existing owner account; it is still accepted only with a valid Firebase token and verified email.
+export const ADMIN_EMAILS = (process.env.ADMIN_EMAILS || 'huynhlamtruong046@gmail.com')
+  .split(',')
+  .map((email) => email.trim().toLowerCase())
+  .filter(Boolean);
+
+export const requireAdmin = async (req: AuthRequest, res: Response, next: NextFunction) => {
+  const token = getBearerToken(req);
+  if (!token) {
+    return res.status(401).json({ error: 'UNAUTHENTICATED', message: 'Vui lòng đăng nhập bằng tài khoản quản trị.' });
+  }
+
+  try {
+    // Never trust client-supplied identity headers, user IDs, token prefixes, or frontend flags.
+    const decodedToken = await adminAuth.verifyIdToken(token);
+    const email = decodedToken.email?.trim().toLowerCase();
+    if (!decodedToken.uid || !email || decodedToken.email_verified !== true) {
+      return res.status(403).json({ error: 'EMAIL_NOT_VERIFIED', message: 'Tài khoản phải xác minh email trước khi truy cập.' });
+    }
+    if (!ADMIN_EMAILS.includes(email)) {
+      return res.status(403).json({ error: 'FORBIDDEN', message: 'Bạn không có quyền quản trị.' });
+    }
+
+    req.user = decodedToken;
+    req.customUserId = decodedToken.uid;
+    return next();
+  } catch (error) {
+    console.warn('Admin Firebase token verification failed:', error);
+    return res.status(401).json({ error: 'INVALID_TOKEN', message: 'Token xác thực không hợp lệ hoặc đã hết hạn.' });
+  }
+};

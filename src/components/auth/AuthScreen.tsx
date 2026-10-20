@@ -1,70 +1,85 @@
 import React, { useState } from 'react';
-import { Heart, Lock, Mail, ArrowRight, ShieldCheck, Sparkles, UserPlus, LogIn, Database } from 'lucide-react';
+import { sendPasswordResetEmail } from 'firebase/auth';
+import { auth } from '../../lib/firebase.ts';
+import { Lock, Mail, ShieldCheck, UserPlus, LogIn } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
 import { CupidLogo } from '../common/CupidLogo';
 
 export const AuthScreen: React.FC = () => {
-  const { login, loginWithGoogle, register, showToast, isDbConnected } = useDating();
+  const { login, loginWithGoogle, register, showToast } = useDating();
   const [mode, setMode] = useState<'login' | 'register' | 'forgot'>('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isLoading, setIsLoading] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!email) {
-      showToast('Vui lòng nhập địa chỉ email hợp lệ');
-      return;
-    }
-
-    if (mode === 'forgot') {
-      showToast(`Đã gửi liên kết khôi phục mật khẩu đến ${email}`);
-      setMode('login');
-      return;
-    }
-
-    if (!password) {
-      showToast('Vui lòng nhập mật khẩu');
-      return;
-    }
-
-    if (mode === 'register' && password !== confirmPassword) {
-      showToast('Mật khẩu xác nhận không khớp');
+    const cleanEmail = email.trim();
+    if (!cleanEmail) {
+      showToast('Vui lòng nhập địa chỉ email.');
       return;
     }
 
     setIsLoading(true);
-    setTimeout(() => {
-      setIsLoading(false);
-      if (mode === 'login') {
-        login(email, false);
-        showToast('Đăng nhập thành công! Đang tải dữ liệu...');
-      } else {
-        register(email);
-        showToast('Đăng ký tài khoản thành công! Hãy nhập thông tin cá nhân của bạn.');
+    try {
+      if (mode === 'forgot') {
+        await sendPasswordResetEmail(auth, cleanEmail);
+        showToast('Nếu email có tài khoản, Firebase đã gửi hướng dẫn đặt lại mật khẩu.');
+        setMode('login');
+        return;
       }
-    }, 500);
+
+      if (!password) {
+        showToast('Vui lòng nhập mật khẩu.');
+        return;
+      }
+      if (mode === 'register' && password.length < 6) {
+        showToast('Mật khẩu cần ít nhất 6 ký tự.');
+        return;
+      }
+      if (mode === 'register' && password !== confirmPassword) {
+        showToast('Mật khẩu xác nhận không khớp.');
+        return;
+      }
+
+      if (mode === 'login') {
+        await login(cleanEmail, password);
+      } else {
+        await register(cleanEmail, password);
+        setPassword('');
+        setConfirmPassword('');
+      }
+    } catch (error: any) {
+      const code = String(error?.code || '');
+      const message = code === 'auth/invalid-credential' || code === 'auth/wrong-password' || code === 'auth/user-not-found'
+        ? 'Email hoặc mật khẩu không chính xác.'
+        : code === 'auth/email-already-in-use'
+          ? 'Email đã có tài khoản. Hãy đăng nhập hoặc dùng chức năng khôi phục mật khẩu.'
+          : code === 'auth/operation-not-allowed'
+            ? 'Firebase chưa bật phương thức Email/Password. Hãy bật trong Authentication → Sign-in method.'
+            : code === 'auth/weak-password'
+              ? 'Mật khẩu cần ít nhất 6 ký tự.'
+              : error?.message || 'Không thể xác thực tài khoản. Vui lòng thử lại.';
+      showToast(message);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleGoogleSignIn = async () => {
     setIsLoading(true);
     try {
       await loginWithGoogle();
-    } catch {
-      showToast('Không thể kết nối Google Login.');
+    } catch (error: any) {
+      const code = String(error?.code || '');
+      const message = code === 'auth/unauthorized-domain'
+        ? 'Tên miền chưa được phép trong Firebase Authentication → Settings → Authorized domains.'
+        : error?.message || 'Không thể đăng nhập bằng Google.';
+      showToast(message);
     } finally {
       setIsLoading(false);
     }
-  };
-
-  const handleQuickNewUser = () => {
-    setIsLoading(true);
-    setTimeout(() => {
-      setIsLoading(false);
-      register(`nguoidung_${Math.floor(Math.random() * 900 + 100)}@gmail.com`);
-      showToast('Bắt đầu quy trình tạo tài khoản người dùng thật');
-    }, 300);
   };
 
   return (
@@ -73,7 +88,7 @@ export const AuthScreen: React.FC = () => {
       <div className="pt-4 pb-4 flex flex-col items-center text-center">
         <CupidLogo size="lg" showWordmark={true} className="mb-2" />
         <p className="text-xs text-neutral-400 mt-1 max-w-xs mx-auto">
-          Ứng dụng kết đôi thông minh · Người dùng thật 100%
+          Kết nối người dùng đã xác minh email
         </p>
       </div>
 
@@ -211,7 +226,7 @@ export const AuthScreen: React.FC = () => {
             ) : mode === 'register' ? (
               <>
                 <UserPlus className="w-3.5 h-3.5" />
-                Đăng ký & Nhập hồ sơ thật
+                Đăng ký và xác minh email
               </>
             ) : (
               'Gửi liên kết khôi phục'
@@ -229,35 +244,12 @@ export const AuthScreen: React.FC = () => {
           </button>
         )}
 
-        <div className="relative my-4">
-          <div className="absolute inset-0 flex items-center">
-            <div className="w-full border-t border-neutral-800" />
-          </div>
-          <div className="relative flex justify-center text-[10px]">
-            <span className="bg-neutral-900 px-2 text-neutral-500">Tiện ích thử nghiệm</span>
-          </div>
-        </div>
-
-        {/* Fast Registration for Testing */}
-        <div className="space-y-2">
-          <button
-            type="button"
-            onClick={handleQuickNewUser}
-            className="w-full py-2.5 px-3 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-xl text-xs font-semibold text-rose-300 flex items-center justify-between transition-colors"
-          >
-            <div className="flex items-center gap-2">
-              <UserPlus className="w-3.5 h-3.5 text-rose-400" />
-              <span>Tạo tài khoản người dùng thật mới</span>
-            </div>
-            <ArrowRight className="w-3.5 h-3.5 text-rose-400" />
-          </button>
-        </div>
       </div>
 
       {/* Safety Notice & Footer */}
       <div className="pt-4 pb-2 text-center text-[11px] text-neutral-400 flex items-center justify-center gap-1.5">
         <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-        <span>Cơ sở dữ liệu Cloud SQL bảo mật, mã hóa dữ liệu 100%</span>
+        <span>Xác minh email · Bảo vệ tài khoản · Hồ sơ riêng tư</span>
       </div>
     </div>
   );

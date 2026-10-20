@@ -38,22 +38,13 @@ export const EditProfileModal: React.FC = () => {
     setPhotos(photos.filter((_, i) => i !== index));
   };
 
-  const handleAddSamplePhoto = (url: string) => {
-    if (photos.length >= 6) {
-      showToast('Tối đa 6 ảnh');
-      return;
-    }
-    if (photos.includes(url)) return;
-    setPhotos([...photos, url]);
-  };
-
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!displayName.trim()) {
       showToast('Họ tên không được để trống');
       return;
     }
 
-    updateProfile({
+    await updateProfile({
       displayName: displayName.trim(),
       bio: bio.trim(),
       jobTitle: jobTitle.trim() || undefined,
@@ -114,7 +105,7 @@ export const EditProfileModal: React.FC = () => {
               ))}
             </div>
 
-            {/* Quick add photo presets & upload */}
+            {/* Upload user-provided photos only */}
             {photos.length < 6 && (
               <div className="mt-3 space-y-2">
                 <input
@@ -122,14 +113,37 @@ export const EditProfileModal: React.FC = () => {
                   id="edit-profile-file-input"
                   accept="image/*"
                   onChange={(e) => {
-                    const file = e.target.files?.[0];
+                    const input = e.currentTarget;
+                    const file = input.files?.[0];
                     if (!file) return;
+                    if (photos.length >= 6) {
+                      showToast('Tối đa 6 ảnh.');
+                      input.value = '';
+                      return;
+                    }
+                    if (!['image/jpeg', 'image/png', 'image/webp'].includes(file.type)) {
+                      showToast('Chỉ chấp nhận ảnh JPG, PNG hoặc WebP.');
+                      input.value = '';
+                      return;
+                    }
+                    if (file.size > 1024 * 1024) {
+                      showToast('Mỗi ảnh tối đa 1 MB để lưu hồ sơ ổn định.');
+                      input.value = '';
+                      return;
+                    }
                     const reader = new FileReader();
                     reader.onload = () => {
-                      if (photos.length < 6) {
-                        setPhotos([...photos, reader.result as string]);
-                        showToast('Đã thêm ảnh từ thiết bị');
+                      if (typeof reader.result === 'string') {
+                        setPhotos((previous) => previous.length < 6 ? [...previous, reader.result as string] : previous);
+                        showToast('Đã thêm ảnh từ thiết bị.');
+                      } else {
+                        showToast('Không đọc được ảnh. Vui lòng thử lại.');
                       }
+                      input.value = '';
+                    };
+                    reader.onerror = () => {
+                      showToast('Không đọc được ảnh. Vui lòng thử lại.');
+                      input.value = '';
                     };
                     reader.readAsDataURL(file);
                   }}
@@ -144,23 +158,6 @@ export const EditProfileModal: React.FC = () => {
                   <Camera className="w-3.5 h-3.5 text-rose-400" />
                   <span>Tải ảnh mới từ thiết bị</span>
                 </button>
-
-                <div className="flex gap-2">
-                  {[
-                    '/src/assets/images/cupid_ha_portrait_1791186074150.jpg',
-                    '/src/assets/images/cupid_linh_portrait_1791186047763.jpg',
-                    'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=400&q=80',
-                  ].map((url, idx) => (
-                    <button
-                      key={idx}
-                      type="button"
-                      onClick={() => handleAddSamplePhoto(url)}
-                      className="w-12 h-12 rounded-lg overflow-hidden border border-neutral-700 hover:border-rose-500 active:scale-95 transition-all"
-                    >
-                      <img src={url} alt="Mẫu" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-                    </button>
-                  ))}
-                </div>
               </div>
             )}
           </div>

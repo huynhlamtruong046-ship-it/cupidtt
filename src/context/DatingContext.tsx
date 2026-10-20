@@ -1,6 +1,15 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import confetti from 'canvas-confetti';
-import { signInWithPopup } from 'firebase/auth';
+import {
+  createUserWithEmailAndPassword,
+  onAuthStateChanged,
+  reload,
+  sendEmailVerification,
+  signInWithEmailAndPassword,
+  signInWithPopup,
+  signOut,
+  User as FirebaseUser,
+} from 'firebase/auth';
 import { auth, googleAuthProvider } from '../lib/firebase.ts';
 import {
   User,
@@ -13,7 +22,17 @@ import {
   ReportItem,
   AdminStats,
 } from '../types/index.ts';
-import { INITIAL_MOCK_PROFILES } from '../data/mockProfiles.ts';
+
+
+async function apiFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  const firebaseUser = auth.currentUser;
+  if (firebaseUser) {
+    const token = await firebaseUser.getIdToken();
+    headers.set('Authorization', `Bearer ${token}`);
+  }
+  return fetch(input, { ...init, headers });
+}
 
 interface DatingContextType {
   currentUser: User | null;
@@ -82,9 +101,9 @@ interface DatingContextType {
   updateFilters: (newFilters: Partial<FilterState>) => void;
   
   // Auth & Onboarding
-  login: (email: string, isDemoReady?: boolean) => void;
+  login: (email: string, password: string) => Promise<void>;
   loginWithGoogle: () => Promise<void>;
-  register: (email: string) => void;
+  register: (email: string, password: string) => Promise<void>;
   logout: () => void;
   completeOnboarding: (data: Partial<Profile>) => Promise<void>;
   updateProfile: (data: Partial<Profile>) => Promise<void>;
@@ -125,59 +144,25 @@ const DEFAULT_FILTERS: FilterState = {
 
 export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // 1. Auth state
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.USER);
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
-  });
-
-  const [currentProfile, setCurrentProfile] = useState<Profile | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.PROFILE);
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
-  });
+  // Never restore a client-side identity as proof of authentication. Firebase restores
+  // the real session; the server then reloads the matching profile from PostgreSQL.
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [currentProfile, setCurrentProfile] = useState<Profile | null>(null);
 
   // 2. Navigation tabs
   const [activeTab, setActiveTab] = useState<'discovery' | 'likes' | 'matches' | 'profile'>('discovery');
   const [activeChatMatchId, setActiveChatMatchId] = useState<string | null>(null);
 
   // 3. Swipes & History
-  const [swipes, setSwipes] = useState<SwipeRecord[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.SWIPES);
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [swipes, setSwipes] = useState<SwipeRecord[]>([]);
 
   const [swipeHistory, setSwipeHistory] = useState<{ profile: Profile; action: SwipeAction }[]>([]);
 
   // 4. Matches
-  const [matches, setMatches] = useState<Match[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.MATCHES);
-      return saved ? JSON.parse(saved) : [];
-    } catch {
-      return [];
-    }
-  });
+  const [matches, setMatches] = useState<Match[]>([]);
 
   // 5. Messages
-  const [messages, setMessages] = useState<Record<string, Message[]>>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEYS.MESSAGES);
-      return saved ? JSON.parse(saved) : {};
-    } catch {
-      return {};
-    }
-  });
+  const [messages, setMessages] = useState<Record<string, Message[]>>({});
 
   // 6. Blocked users
   const [blockedIds, setBlockedIds] = useState<string[]>(() => {
@@ -211,26 +196,19 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   // Admin Management State
   const [isAdminMode, setIsAdminMode] = useState(false);
-  const [allManagedProfiles, setAllManagedProfiles] = useState<Profile[]>(() => {
-    try {
-      const saved = localStorage.getItem('cupid_managed_profiles_v1');
-      return saved ? JSON.parse(saved) : INITIAL_MOCK_PROFILES;
-    } catch {
-      return INITIAL_MOCK_PROFILES;
-    }
-  });
+  const [allManagedProfiles, setAllManagedProfiles] = useState<Profile[]>([]);
 
   const [reportsList, setReportsList] = useState<ReportItem[]>([]);
   const [adminStats, setAdminStats] = useState<AdminStats>({
-    totalUsers: 15,
-    premiumUsers: 4,
-    totalSwipes: 284,
-    totalMatches: 38,
+    totalUsers: 0,
+    premiumUsers: 0,
+    totalSwipes: 0,
+    totalMatches: 0,
     pendingReports: 0,
-    estimatedRevenue: 1196000,
+    estimatedRevenue: 0,
   });
 
-  const [isDbConnected, setIsDbConnected] = useState(true);
+  const [isDbConnected, setIsDbConnected] = useState(false);
 
   // 9. Candidate profiles from Cloud SQL
   const [candidateProfiles, setCandidateProfiles] = useState<Profile[]>([]);
@@ -238,12 +216,12 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   // 10. Toast notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const showToast = (msg: string) => {
+  const showToast = useCallback((msg: string) => {
     setToastMessage(msg);
     setTimeout(() => {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 2800);
-  };
+  }, []);
 
   // Real-time WebSocket connection for live messaging
   const wsRef = useRef<WebSocket | null>(null);
@@ -258,17 +236,22 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws?userId=${encodeURIComponent(currentUser.id)}`;
+    const wsUrl = `${protocol}//${window.location.host}/ws`;
     let ws: WebSocket | null = null;
-    let reconnectTimeout: any = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+    let disposed = false;
 
-    const connect = () => {
+    const connect = async () => {
       try {
-        ws = new WebSocket(wsUrl);
+        const firebaseUser = auth.currentUser;
+        if (!firebaseUser) return;
+        const token = await firebaseUser.getIdToken();
+        if (disposed) return;
+        ws = new WebSocket(wsUrl, ['cupidgo-v1', `firebase.${token}`]);
         wsRef.current = ws;
 
         ws.onopen = () => {
-          setIsDbConnected(true);
+          // WebSocket readiness does not prove PostgreSQL is healthy.
         };
 
         ws.onmessage = (event) => {
@@ -315,7 +298,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         };
 
         ws.onclose = () => {
-          reconnectTimeout = setTimeout(connect, 3000);
+          if (!disposed) reconnectTimeout = setTimeout(() => { void connect(); }, 3000);
         };
 
         ws.onerror = () => {
@@ -326,17 +309,18 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }
     };
 
-    connect();
+    void connect();
 
     return () => {
-      clearTimeout(reconnectTimeout);
+      disposed = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
       if (ws) {
         ws.onclose = null;
         ws.close();
       }
       wsRef.current = null;
     };
-  }, [currentUser?.id, activeChatMatchId]);
+  }, [currentUser?.id]);
 
   // Safe helper to write to localStorage without crashing on QuotaExceededError
   const safeSetStorage = useCallback((key: string, value: any) => {
@@ -412,49 +396,39 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     safeSetStorage(STORAGE_KEYS.FILTERS, filters);
   }, [filters, safeSetStorage]);
 
-  // Load candidate profiles from Cloud SQL database
-  const loadCandidatesFromDb = useCallback(async (userId?: string) => {
-    const uid = userId || currentUser?.id || 'user_me_001';
+  // Load only real profiles from the authenticated PostgreSQL API.
+  const loadCandidatesFromDb = useCallback(async (_userId?: string) => {
+    if (!currentUser?.id) return;
     try {
-      const res = await fetch('/api/profiles/candidates', {
+      const res = await apiFetch('/api/profiles/candidates', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: uid, filters }),
+        body: JSON.stringify({ filters }),
       });
-      if (res.ok) {
-        const data = await res.json();
-        if (data.candidates && Array.isArray(data.candidates)) {
-          setCandidateProfiles(data.candidates);
-        }
-      }
-    } catch (err) {
-      console.warn('Failed to fetch candidates from DB, using fallback profiles:', err);
-      // Fallback to local filtering
-      const swipedIds = new Set(swipes.map((s) => s.targetId));
-      const filtered = allManagedProfiles.filter((p) => {
-        if (p.isBanned || blockedIds.includes(p.userId) || swipedIds.has(p.userId)) return false;
-        if (filters.gender !== 'BOTH' && p.gender !== filters.gender) return false;
-        if (p.age < filters.minAge || p.age > filters.maxAge) return false;
-        return true;
-      });
-      setCandidateProfiles(filtered);
+      if (!res.ok) throw new Error(`Candidate API returned ${res.status}`);
+      const data = await res.json();
+      setCandidateProfiles(Array.isArray(data.candidates) ? data.candidates : []);
+      setIsDbConnected(true);
+    } catch (error) {
+      console.error('Could not load verified candidate profiles:', error);
+      setCandidateProfiles([]);
+      setIsDbConnected(false);
+      showToast('Không tải được hồ sơ thật. Hãy kiểm tra kết nối cơ sở dữ liệu.');
     }
-  }, [currentUser?.id, filters, swipes, allManagedProfiles, blockedIds]);
+  }, [currentUser?.id, filters, showToast]);
 
   // Load matches from Cloud SQL database
   const loadMatchesFromDb = useCallback(async (userId?: string) => {
     const uid = userId || currentUser?.id;
     if (!uid) return;
     try {
-      const res = await fetch(`/api/matches?userId=${uid}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.matches) {
-          setMatches(data.matches);
-        }
-      }
+      const res = await apiFetch('/api/matches');
+      if (!res.ok) throw new Error(`Matches API returned ${res.status}`);
+      const data = await res.json();
+      setMatches(Array.isArray(data.matches) ? data.matches : []);
     } catch (err) {
       console.warn('Failed to load matches from DB:', err);
+      setMatches([]);
     }
   }, [currentUser?.id]);
 
@@ -463,15 +437,13 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     const uid = userId || currentUser?.id;
     if (!uid) return;
     try {
-      const res = await fetch(`/api/profiles/liked-me?userId=${uid}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data.likes) {
-          setLikedMeProfiles(data.likes);
-        }
-      }
+      const res = await apiFetch('/api/profiles/liked-me');
+      if (!res.ok) throw new Error(`Likes API returned ${res.status}`);
+      const data = await res.json();
+      setLikedMeProfiles(Array.isArray(data.likes) ? data.likes : []);
     } catch (err) {
       console.warn('Failed to load likes from DB:', err);
+      setLikedMeProfiles([]);
     }
   }, [currentUser?.id]);
 
@@ -479,9 +451,9 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   const loadAdminData = useCallback(async () => {
     try {
       const [statsRes, profRes, repRes] = await Promise.all([
-        fetch('/api/admin/stats'),
-        fetch('/api/admin/profiles'),
-        fetch('/api/admin/reports'),
+        apiFetch('/api/admin/stats'),
+        apiFetch('/api/admin/profiles'),
+        apiFetch('/api/admin/reports'),
       ]);
       if (statsRes.ok) {
         const s = await statsRes.json();
@@ -538,94 +510,46 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const currentCandidate = candidateProfiles[0] || null;
 
-  // Swipe Action Handler - Persisted to Cloud SQL
+  // Swipe and matching decisions are made by PostgreSQL; do not fabricate local matches on API failure.
   const swipe = async (action: SwipeAction) => {
     if (!currentCandidate || !currentUser) return;
 
     const target = currentCandidate;
-    const newSwipe: SwipeRecord = {
-      id: `swipe_${Date.now()}`,
+    const swipeId = `pending_${Date.now()}`;
+    setSwipes((prev) => [...prev, {
+      id: swipeId,
       swiperId: currentUser.id,
       targetId: target.userId,
       action,
       createdAt: new Date().toISOString(),
-    };
-
-    setSwipes((prev) => [...prev, newSwipe]);
+    }]);
     setSwipeHistory((prev) => [...prev, { profile: target, action }]);
-    setCandidateProfiles((prev) => prev.slice(1));
+    setCandidateProfiles((prev) => prev.filter((profile) => profile.userId !== target.userId));
 
-    // Send swipe to backend Cloud SQL
     try {
-      const res = await fetch('/api/swipes', {
+      const res = await apiFetch('/api/swipes', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          swiperId: currentUser.id,
-          targetId: target.userId,
-          action,
-        }),
+        body: JSON.stringify({ targetId: target.userId, action }),
       });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.message || data.error || `Swipe API returned ${res.status}`);
 
-      if (res.ok) {
-        const data = await res.json();
-        if (data.isMatch) {
-          const newMatch: Match = {
-            id: data.matchId || `match_${Date.now()}`,
-            user1Id: currentUser.id,
-            user2Id: target.userId,
-            matchedAt: new Date().toISOString(),
-            partnerProfile: target,
-            lastMessage: action === 'SUPER_LIKE' ? '✨ Bạn đã gửi Super Like cho người này!' : '🎉 Hai bạn đã tương hợp!',
-            lastMessageTime: 'Vừa xong',
-            unreadCount: 0,
-          };
-
-          setMatches((prev) => [newMatch, ...prev.filter((m) => m.partnerProfile.userId !== target.userId)]);
-          setActiveMatchModal(target);
-
-          // Trigger Confetti!
-          try {
-            confetti({
-              particleCount: 90,
-              spread: 75,
-              origin: { y: 0.6 },
-              colors: ['#FF4458', '#FE6B8B', '#FFD700', '#FF758C'],
-            });
-          } catch {}
-          return;
-        }
+      if (data.isMatch) {
+        await loadMatchesFromDb(currentUser.id);
+        setActiveMatchModal(target);
+        try {
+          confetti({ particleCount: 90, spread: 75, origin: { y: 0.6 }, colors: ['#FF4458', '#FE6B8B', '#FFD700', '#FF758C'] });
+        } catch {}
+      } else if (action === 'SUPER_LIKE') {
+        showToast(`Đã gửi Siêu Thích cho ${target.displayName}.`);
       }
-    } catch (err) {
-      console.warn('DB Swipe sync failed, checked local match logic:', err);
-    }
-
-    // Local match fallback
-    if ((action === 'LIKE' || action === 'SUPER_LIKE') && target.hasLikedCurrentUser) {
-      const newMatch: Match = {
-        id: `match_${Date.now()}`,
-        user1Id: currentUser.id,
-        user2Id: target.userId,
-        matchedAt: new Date().toISOString(),
-        partnerProfile: target,
-        lastMessage: action === 'SUPER_LIKE' ? '⭐ Bạn đã Siêu Thích người này!' : 'Tương hợp mới! Hãy gửi lời chào ngay.',
-        lastMessageTime: 'Vừa xong',
-        unreadCount: 0,
-      };
-
-      setMatches((prev) => [newMatch, ...prev.filter((m) => m.partnerProfile.userId !== target.userId)]);
-      setActiveMatchModal(target);
-
-      try {
-        confetti({
-          particleCount: 80,
-          spread: 70,
-          origin: { y: 0.6 },
-          colors: ['#FF4458', '#FE6B8B', '#FFD700', '#FF758C'],
-        });
-      } catch {}
-    } else if (action === 'SUPER_LIKE') {
-      showToast(`Đã gửi Siêu Thích ⭐ cho ${target.displayName}!`);
+    } catch (error) {
+      console.error('Swipe persistence failed:', error);
+      setSwipes((prev) => prev.filter((swipeRecord) => swipeRecord.id !== swipeId));
+      setSwipeHistory((prev) => prev.filter((record) => record.profile.userId !== target.userId));
+      setCandidateProfiles((prev) => [target, ...prev.filter((profile) => profile.userId !== target.userId)]);
+      showToast('Không lưu được lượt thích. Hãy kiểm tra kết nối rồi thử lại.');
     }
   };
 
@@ -648,7 +572,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setCandidateProfiles((prev) => [last.profile, ...prev]);
 
     // Send rewind to Cloud SQL
-    fetch('/api/swipes/rewind', {
+    apiFetch('/api/swipes/rewind', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ swiperId: currentUser?.id }),
@@ -689,21 +613,20 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   useEffect(() => {
     if (!activeChatMatchId) return;
 
-    fetch(`/api/matches/${activeChatMatchId}/messages`)
-      .then(res => res.json())
-      .then(data => {
-        if (data.messages && data.messages.length > 0) {
-          setMessages(prev => ({
-            ...prev,
-            [activeChatMatchId]: data.messages,
-          }));
-        }
+    apiFetch(`/api/matches/${encodeURIComponent(activeChatMatchId)}/messages`)
+      .then(async (res) => {
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || `Messages API returned ${res.status}`);
+        setMessages((prev) => ({
+          ...prev,
+          [activeChatMatchId]: Array.isArray(data.messages) ? data.messages : [],
+        }));
       })
-      .catch(console.warn);
+      .catch((error) => console.warn('Could not load persisted chat messages:', error));
 
     // Mark as read in backend
     if (currentUser?.id) {
-      fetch(`/api/matches/${activeChatMatchId}/read`, {
+      apiFetch(`/api/matches/${activeChatMatchId}/read`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ readerId: currentUser.id }),
@@ -711,7 +634,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     }
   }, [activeChatMatchId, currentUser?.id]);
 
-  // Send message - Persisted to Cloud SQL with progressive status (sent -> delivered -> read)
+  // Persist the message once through the authenticated API. The server broadcasts the saved row.
   const sendMessage = async (
     matchId: string,
     content: string,
@@ -719,87 +642,47 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     imageUrl?: string
   ) => {
     if (!currentUser) return;
-
-    const msgId = `msg_${Date.now()}`;
-    const newMessage: Message = {
-      id: msgId,
+    const tempId = `pending_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const optimistic: Message = {
+      id: tempId,
       matchId,
       senderId: currentUser.id,
       content,
       type,
       imageUrl,
       isRead: false,
-      status: 'sent',
-      sentAt: new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }),
+      status: 'sending',
+      sentAt: new Date().toISOString(),
     };
+    setMessages((previous) => ({ ...previous, [matchId]: [...(previous[matchId] || []), optimistic] }));
 
-    setMessages((prev) => ({
-      ...prev,
-      [matchId]: [...(prev[matchId] || []), newMessage],
-    }));
-
-    // Update match last message
-    setMatches((prev) =>
-      prev.map((m) =>
-        m.id === matchId
-          ? {
-              ...m,
-              lastMessage: type === 'IMAGE' ? '📷 [Hình ảnh]' : content,
-              lastMessageTime: 'Vừa xong',
-            }
-          : m
-      )
-    );
-
-    // Transition from 'sent' to 'delivered' shortly after dispatch
-    setTimeout(() => {
-      setMessages((prev) => ({
-        ...prev,
-        [matchId]: (prev[matchId] || []).map((m) =>
-          m.id === msgId && m.status === 'sent' ? { ...m, status: 'delivered' } : m
-        ),
-      }));
-    }, 600);
-
-    // Find partnerId in this match for real-time routing
-    const targetMatch = matches.find((m) => m.id === matchId);
-    const partnerId = targetMatch
-      ? (targetMatch.user1Id === currentUser.id ? targetMatch.user2Id : targetMatch.user1Id)
-      : undefined;
-
-    // Send in real-time over WebSocket if open
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && partnerId) {
-      try {
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'SEND_MESSAGE',
-            matchId,
-            receiverId: partnerId,
-            content,
-            messageType: type,
-            imageUrl,
-          })
-        );
-      } catch (wsErr) {
-        console.warn('WS send failed, will persist via HTTP POST:', wsErr);
-      }
-    }
-
-    // Persist message to Cloud SQL database
     try {
-      await fetch(`/api/matches/${matchId}/messages`, {
+      const response = await apiFetch(`/api/matches/${encodeURIComponent(matchId)}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          senderId: currentUser.id,
-          receiverId: partnerId,
-          content,
-          type,
-          imageUrl,
-        }),
+        body: JSON.stringify({ content, type, imageUrl }),
       });
-    } catch (err) {
-      console.warn('Failed to save message to DB:', err);
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok || !data.message) {
+        throw new Error(data.message || data.error || `Gửi tin nhắn thất bại (${response.status}).`);
+      }
+      const savedMessage = data.message as Message;
+      setMessages((previous) => ({
+        ...previous,
+        [matchId]: (previous[matchId] || []).map((message) => message.id === tempId ? savedMessage : message),
+      }));
+      setMatches((previous) => previous.map((match) => match.id === matchId ? {
+        ...match,
+        lastMessage: type === 'IMAGE' ? '📷 [Hình ảnh]' : content,
+        lastMessageTime: savedMessage.sentAt,
+      } : match));
+    } catch (error) {
+      setMessages((previous) => ({
+        ...previous,
+        [matchId]: (previous[matchId] || []).filter((message) => message.id !== tempId),
+      }));
+      console.error('Message persistence failed:', error);
+      showToast('Không gửi được tin nhắn. Hãy kiểm tra kết nối rồi thử lại.');
     }
   };
 
@@ -816,7 +699,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     setBlockReportModal(null);
 
     try {
-      await fetch('/api/reports', {
+      await apiFetch('/api/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -833,7 +716,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
   const reportUser = async (targetId: string, reason: string) => {
     try {
-      await fetch('/api/reports', {
+      await apiFetch('/api/reports', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -858,171 +741,180 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     showToast('Đã cập nhật bộ lọc khám phá.');
   };
 
-  // Auth: Email Login & Sync with Cloud SQL
-  const login = async (email: string) => {
-    const cleanEmail = email.trim().toLowerCase();
-    const uid = cleanEmail === 'huynhlamtruong046@gmail.com' ? 'Ak7nIqR8fpQ2eIUP3zQE790MOBH2' : `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-
-    try {
-      const res = await fetch('/api/auth/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uid, email: cleanEmail }),
-      });
-      const data = await res.json();
-
-      const user: User = {
-        id: data.user?.uid || uid,
-        email: cleanEmail,
-        phoneNumber: data.user?.phoneNumber || undefined,
-        isPremium: !!data.user?.isPremium,
-        premiumTier: data.user?.premiumTier || undefined,
-        isCompleted: !!data.profile,
-        superLikesRemaining: 5,
-        rewindRemaining: 5,
-        createdAt: new Date().toISOString(),
-      };
-      setCurrentUser(user);
-
-      if (data.profile) {
-        setCurrentProfile(data.profile);
-      } else {
-        setCurrentProfile(null);
-      }
-
-      loadCandidatesFromDb(uid);
-      loadMatchesFromDb(uid);
-    } catch (err) {
-      console.warn('Sync with DB failed, fallback to local login:', err);
-      const user: User = {
-        id: uid,
-        email: cleanEmail,
-        phoneNumber: '0912345678',
-        isPremium: false,
-        isCompleted: false,
-        superLikesRemaining: 5,
-        rewindRemaining: 5,
-        createdAt: new Date().toISOString(),
-      };
-      setCurrentUser(user);
+  // Sync a verified Firebase account with the existing PostgreSQL user/profile records.
+  const syncFirebaseUser = useCallback(async (firebaseUser: FirebaseUser) => {
+    await reload(firebaseUser);
+    if (!firebaseUser.emailVerified || !firebaseUser.email) {
+      setCurrentUser(null);
       setCurrentProfile(null);
+      return false;
     }
-  };
 
-  // Auth: Google Sign In with Firebase & Sync with Cloud SQL
-  const loginWithGoogle = async () => {
-    try {
-      const cred = await signInWithPopup(auth, googleAuthProvider);
-      const fbUser = cred.user;
-      const token = await fbUser.getIdToken();
-
-      const res = await fetch('/api/auth/sync', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          uid: fbUser.uid,
-          email: fbUser.email || `${fbUser.uid}@gmail.com`,
-          phoneNumber: fbUser.phoneNumber || undefined,
-        }),
-      });
-
-      const data = await res.json();
-
-      const user: User = {
-        id: fbUser.uid,
-        email: fbUser.email || '',
-        phoneNumber: fbUser.phoneNumber || undefined,
-        isPremium: false,
-        isCompleted: !!data.profile,
-        superLikesRemaining: 5,
-        rewindRemaining: 3,
-        createdAt: new Date().toISOString(),
-      };
-
-      setCurrentUser(user);
-      if (data.profile) {
-        setCurrentProfile(data.profile);
-      } else {
-        // Real Google user pre-population without synthetic presets
-        setCurrentProfile({
-          userId: fbUser.uid,
-          displayName: fbUser.displayName || 'Người dùng mới',
-          gender: 'OTHER',
-          birthDate: '2000-01-01',
-          age: 24,
-          bio: '',
-          photos: fbUser.photoURL ? [fbUser.photoURL] : [],
-          locationName: 'Việt Nam',
-          latitude: 10.7769,
-          longitude: 106.7009,
-          distanceKm: 0,
-          interests: [],
-          targetGender: 'BOTH',
-          minAgePref: 18,
-          maxAgePref: 50,
-          maxDistancePref: 50,
-          lookingFor: 'Hẹn hò tìm hiểu',
-          compatibilityRate: 90,
-          lifestyle: {},
-        });
-      }
-
-      loadCandidatesFromDb(fbUser.uid);
-      loadMatchesFromDb(fbUser.uid);
-      showToast(`Chào mừng ${fbUser.displayName || fbUser.email}! Đã kết nối với Cloud SQL.`);
-    } catch (err: any) {
-      console.error('Google login failed:', err);
-      showToast('Đăng nhập Google thất bại: ' + (err.message || 'Lỗi kết nối'));
+    const token = await firebaseUser.getIdToken(true);
+    const response = await fetch('/api/auth/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ phoneNumber: firebaseUser.phoneNumber || undefined }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.user) {
+      throw new Error(data.message || data.error || `Đồng bộ tài khoản thất bại (${response.status}).`);
     }
-  };
 
-  const register = async (email: string) => {
-    const cleanEmail = email.trim().toLowerCase();
-    const uid = cleanEmail === 'huynhlamtruong046@gmail.com' ? 'Ak7nIqR8fpQ2eIUP3zQE790MOBH2' : `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
-    const newUser: User = {
-      id: uid,
-      email: cleanEmail,
-      isPremium: false,
-      isCompleted: false, // Forces onboarding flow for real info input!
-      superLikesRemaining: 3,
-      rewindRemaining: 3,
-      createdAt: new Date().toISOString(),
+    const syncedUser: User = {
+      id: data.user.uid,
+      email: data.user.email,
+      phoneNumber: data.user.phoneNumber || firebaseUser.phoneNumber || undefined,
+      isPremium: Boolean(data.user.isPremium),
+      premiumTier: data.user.premiumTier || undefined,
+      premiumExpiry: data.user.premiumExpiry || undefined,
+      isCompleted: Boolean(data.user.isCompleted || data.profile),
+      superLikesRemaining: data.user.superLikesRemaining ?? 5,
+      rewindRemaining: data.user.rewindRemaining ?? 3,
+      boostActiveUntil: data.user.boostActiveUntil || undefined,
+      createdAt: data.user.createdAt ? new Date(data.user.createdAt).toISOString() : new Date().toISOString(),
     };
 
-    setCurrentUser(newUser);
-    setCurrentProfile(null);
+    setCurrentUser(syncedUser);
+    setCurrentProfile(data.profile || null);
+    setIsDbConnected(true);
+    return true;
+  }, []);
 
+  // Restore only a real Firebase session after refreshing Firebase's server-side user state.
+  useEffect(() => {
+    const clearSignedInState = () => {
+      setCurrentUser(null);
+      setCurrentProfile(null);
+      setCandidateProfiles([]);
+      setLikedMeProfiles([]);
+      setMatches([]);
+      setMessages({});
+      setSwipes([]);
+      setIsAdminMode(false);
+      setIsDbConnected(false);
+    };
+
+    const unsubscribe = onAuthStateChanged(auth, (firebaseUser) => {
+      if (!firebaseUser) {
+        clearSignedInState();
+        return;
+      }
+
+      void (async () => {
+        try {
+          await reload(firebaseUser);
+          if (!firebaseUser.emailVerified || !firebaseUser.email) {
+            clearSignedInState();
+            await signOut(auth).catch(() => undefined);
+            return;
+          }
+          await syncFirebaseUser(firebaseUser);
+        } catch (error) {
+          console.error('Firebase session sync failed:', error);
+          clearSignedInState();
+          showToast('Không thể tải tài khoản từ máy chủ. Hãy kiểm tra kết nối dữ liệu và đăng nhập lại.');
+          try { await signOut(auth); } catch {}
+        }
+      })();
+    });
+    return unsubscribe;
+  }, [showToast, syncFirebaseUser]);
+
+  // Email/password login uses Firebase Authentication, never a client-generated UID.
+  const login = async (email: string, password: string) => {
+    const credential = await signInWithEmailAndPassword(auth, email.trim(), password);
+    await reload(credential.user);
+    if (!credential.user.emailVerified) {
+      try { await sendEmailVerification(credential.user); } catch (error) {
+        console.warn('Could not resend Firebase verification email:', error);
+      }
+      await signOut(auth);
+      setCurrentUser(null);
+      setCurrentProfile(null);
+      showToast('Email chưa được xác minh. Hãy mở liên kết trong hộp thư rồi đăng nhập lại.');
+      return;
+    }
     try {
-      await fetch('/api/auth/sync', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uid, email: cleanEmail, isCompleted: false }),
-      });
-    } catch {}
+      await syncFirebaseUser(credential.user);
+      showToast('Đăng nhập thành công.');
+    } catch (error) {
+      setCurrentUser(null);
+      setCurrentProfile(null);
+      await signOut(auth).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  // Google sign-in follows the same verified Firebase ID-token path.
+  const loginWithGoogle = async () => {
+    const credential = await signInWithPopup(auth, googleAuthProvider);
+    await reload(credential.user);
+    if (!credential.user.emailVerified) {
+      await signOut(auth);
+      throw new Error('Tài khoản Google chưa có email được xác minh.');
+    }
+    try {
+      await syncFirebaseUser(credential.user);
+      showToast(`Chào mừng ${credential.user.displayName || credential.user.email || 'bạn'}!`);
+    } catch (error) {
+      setCurrentUser(null);
+      setCurrentProfile(null);
+      await signOut(auth).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  // Create account in Firebase and require clicking the real verification link before use.
+  const register = async (email: string, password: string) => {
+    const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+    try {
+      await sendEmailVerification(credential.user);
+    } finally {
+      await signOut(auth).catch(() => undefined);
+      setCurrentUser(null);
+      setCurrentProfile(null);
+    }
+    showToast('Đã gửi liên kết xác minh đến email. Hãy xác minh trước khi đăng nhập.');
   };
 
   const logout = () => {
+    void signOut(auth).catch((error) => console.warn('Firebase sign-out failed:', error));
     setCurrentUser(null);
     setCurrentProfile(null);
     setActiveTab('discovery');
     setActiveChatMatchId(null);
+    setMatches([]);
+    setMessages({});
+    setSwipes([]);
+    setCandidateProfiles([]);
+    setLikedMeProfiles([]);
+    setIsAdminMode(false);
+    setIsDbConnected(false);
+    try {
+      localStorage.removeItem(STORAGE_KEYS.USER);
+      localStorage.removeItem(STORAGE_KEYS.PROFILE);
+      localStorage.removeItem(STORAGE_KEYS.MATCHES);
+      localStorage.removeItem(STORAGE_KEYS.MESSAGES);
+      localStorage.removeItem(STORAGE_KEYS.SWIPES);
+    } catch {}
   };
 
-  // Complete Onboarding - Persists Real Person Profile to Cloud SQL!
+  // Persist the profile before switching the user into the main app.
   const completeOnboarding = async (data: Partial<Profile>) => {
     if (!currentUser) return;
 
     const completedProfile: Profile = {
       userId: currentUser.id,
-      displayName: data.displayName || 'Người dùng',
+      displayName: data.displayName?.trim() || '',
       gender: data.gender || 'OTHER',
-      birthDate: data.birthDate || '2000-01-01',
-      age: data.age || 24,
+      birthDate: data.birthDate || '',
+      age: data.age || 0,
       bio: data.bio || '',
-      photos: data.photos && data.photos.length > 0 ? data.photos : [],
+      photos: data.photos || [],
       locationName: data.locationName || 'Việt Nam',
       latitude: data.latitude ?? 10.7769,
       longitude: data.longitude ?? 106.7009,
@@ -1039,89 +931,62 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       zodiac: data.zodiac,
       heightCm: data.heightCm,
       lifestyle: data.lifestyle || {},
-      compatibilityRate: 95,
+      compatibilityRate: 0,
       isVerified: false,
     };
 
-    setCurrentProfile(completedProfile);
-    setCurrentUser((prev) => (prev ? { ...prev, isCompleted: true } : null));
-    setActiveTab('discovery');
-
-    // Save directly to PostgreSQL via REST API
     try {
-      const res = await fetch('/api/profiles', {
+      const res = await apiFetch('/api/profiles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(completedProfile),
       });
-      if (res.ok) {
-        const result = await res.json();
-        if (result.profile) {
-          setCurrentProfile(result.profile);
-        }
+      const result = await res.json().catch(() => ({}));
+      if (!res.ok || !result.profile) {
+        throw new Error(result.message || result.error || `Không lưu được hồ sơ (${res.status}).`);
       }
-    } catch (err) {
-      console.error('Failed to save profile to Cloud SQL:', err);
+      setCurrentProfile(result.profile);
+      setCurrentUser((prev) => (prev ? { ...prev, isCompleted: true } : null));
+      setActiveTab('discovery');
+      setIsDbConnected(true);
+      showToast('Đã lưu hồ sơ vào cơ sở dữ liệu.');
+      await loadCandidatesFromDb(currentUser.id);
+    } catch (error) {
+      console.error('Profile onboarding save failed:', error);
+      showToast('Không lưu được hồ sơ. Hãy kiểm tra kết nối cơ sở dữ liệu rồi thử lại.');
     }
-
-    showToast('🎉 Chúc mừng bạn đã hoàn tất hồ sơ! Dữ liệu đã lưu an toàn vào cơ sở dữ liệu SQL.');
-    loadCandidatesFromDb(currentUser.id);
   };
 
-  // Update Profile - Persists Changes to Cloud SQL!
+  // Save profile edits to PostgreSQL and only report success when the API confirms.
   const updateProfile = async (data: Partial<Profile>) => {
-    if (!currentUser) return;
-
-    setCurrentProfile((prev) => (prev ? { ...prev, ...data } : null));
+    if (!currentUser || !currentProfile) return;
+    const previousProfile = currentProfile;
+    const updatedData = { ...currentProfile, ...data, userId: currentUser.id };
+    setCurrentProfile(updatedData);
 
     try {
-      const updatedData = { ...currentProfile, ...data, userId: currentUser.id };
-      await fetch('/api/profiles', {
+      const response = await apiFetch('/api/profiles', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updatedData),
       });
-    } catch (err) {
-      console.error('Failed to update profile to Cloud SQL:', err);
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.profile) {
+        throw new Error(result.message || result.error || `Không lưu được hồ sơ (${response.status}).`);
+      }
+      setCurrentProfile(result.profile);
+      showToast('Đã lưu thay đổi hồ sơ.');
+    } catch (error) {
+      setCurrentProfile(previousProfile);
+      console.error('Profile update failed:', error);
+      showToast('Không lưu được hồ sơ. Vui lòng kiểm tra kết nối rồi thử lại.');
     }
-
-    showToast('Đã lưu thông tin hồ sơ vào cơ sở dữ liệu SQL.');
   };
 
-  // Upgrade Premium - Persists to Cloud SQL!
-  const upgradePremium = async (tier: '1_month' | '3_months' | '6_months' | '12_months') => {
-    if (!currentUser) return;
-
-    setCurrentUser((prev) =>
-      prev
-        ? {
-            ...prev,
-            isPremium: true,
-            premiumTier: tier,
-            superLikesRemaining: 99,
-            rewindRemaining: 99,
-          }
-        : null
-    );
-
-    try {
-      await fetch('/api/user/premium', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: currentUser.id, tier }),
-      });
-    } catch {}
-
+  // Premium cannot be granted by a client-side click; payment verification must be integrated first.
+  const upgradePremium = (_tier: '1_month' | '3_months' | '6_months' | '12_months') => {
     setIsPremiumModalOpen(false);
-    showToast('✨ Chúc mừng! Bạn đã nâng cấp CupidGo VIP thành công!');
-    try {
-      confetti({
-        particleCount: 100,
-        spread: 80,
-        origin: { y: 0.5 },
-        colors: ['#FFD700', '#FFA500', '#FF4458'],
-      });
-    } catch {}
+    showToast('Thanh toán VIP chưa được tích hợp. Tài khoản chưa bị tính phí và chưa được nâng cấp.');
   };
 
   // Admin Actions - All Persist directly to Cloud SQL!
@@ -1131,7 +996,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     try {
-      const res = await fetch(`/api/admin/users/${userId}/verify`, { method: 'POST' });
+      const res = await apiFetch(`/api/admin/users/${userId}/verify`, { method: 'POST' });
       const data = await res.json();
       showToast(`Đã ${data.isVerified ? 'xác thực tick xanh' : 'hủy xác thực'} trong CSDL SQL.`);
     } catch {
@@ -1145,7 +1010,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     try {
-      const res = await fetch(`/api/admin/users/${userId}/ban`, { method: 'POST' });
+      const res = await apiFetch(`/api/admin/users/${userId}/ban`, { method: 'POST' });
       const data = await res.json();
       showToast(`Đã ${data.isBanned ? 'khóa tài khoản' : 'mở khóa'} trong CSDL SQL.`);
     } catch {
@@ -1159,7 +1024,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     try {
-      await fetch(`/api/admin/users/${userId}/vip`, {
+      await apiFetch(`/api/admin/users/${userId}/vip`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ isVip }),
@@ -1182,7 +1047,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     );
 
     try {
-      await fetch(`/api/admin/reports/${reportId}/resolve`, {
+      await apiFetch(`/api/admin/reports/${reportId}/resolve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -1192,32 +1057,30 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const addNewProfile = async (profile: Profile) => {
-    setAllManagedProfiles((prev) => [profile, ...prev]);
-    setCandidateProfiles((prev) => [profile, ...prev]);
-
-    // Save to Cloud SQL
     try {
-      const res = await fetch('/api/admin/profiles/new', {
+      const res = await apiFetch('/api/admin/profiles/new', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(profile),
       });
-      if (res.ok) {
-        showToast(`Hồ sơ "${profile.displayName}" đã được ghi thành công vào Cloud SQL!`);
-        loadAdminData();
-        return;
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.profile) {
+        throw new Error(data.error || `Không thể lưu hồ sơ (${res.status}).`);
       }
-    } catch (err) {
-      console.warn('Failed to save new profile to DB:', err);
+      setAllManagedProfiles((prev) => [data.profile, ...prev.filter((item) => item.userId !== data.profile.userId)]);
+      await loadAdminData();
+      showToast('Đã cập nhật hồ sơ tài khoản đã xác minh.');
+    } catch (error) {
+      console.warn('Admin profile operation failed:', error);
+      showToast(error instanceof Error ? error.message : 'Không thể lưu hồ sơ.');
     }
-    showToast(`Đã thêm hồ sơ "${profile.displayName}" vào hệ thống.`);
   };
 
   // Reset swipe history for current user so they can rediscover real candidate profiles without affecting their personal data
   const resetSwipeHistoryForCurrentUser = async () => {
     if (!currentUser) return;
     try {
-      await fetch('/api/swipes/reset', {
+      await apiFetch('/api/swipes/reset', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ swiperId: currentUser.id }),

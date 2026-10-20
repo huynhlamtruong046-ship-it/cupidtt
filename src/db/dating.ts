@@ -1,7 +1,13 @@
 import { eq, and, or, notInArray, desc, sql } from 'drizzle-orm';
+import { randomUUID } from 'node:crypto';
 import { db } from './index.ts';
 import { users, profiles, swipes, matches, messages, reports } from './schema.ts';
 import { Profile, SwipeAction, FilterState } from '../types/index.ts';
+
+
+function cryptoRandomId(): string {
+  return randomUUID();
+}
 
 // Helper to transform DB profile to application Profile
 function toAppProfile(row: typeof profiles.$inferSelect, distanceKm = 3.5): Profile {
@@ -77,7 +83,7 @@ export async function getUserByEmail(email: string) {
     return rows[0] || null;
   } catch (error) {
     console.error('Failed to get user by email:', error);
-    return null;
+    throw new Error('Database user lookup by email failed', { cause: error });
   }
 }
 
@@ -87,7 +93,7 @@ export async function getUserByUid(uid: string) {
     return rows[0] || null;
   } catch (error) {
     console.error('Failed to get user by uid:', error);
-    return null;
+    throw new Error('Database user lookup by UID failed', { cause: error });
   }
 }
 
@@ -186,14 +192,12 @@ export async function getOrCreateUser(uid: string, email: string, phoneNumber?: 
     }
 
     const cleanEmail = (email || `${uid}@cupidgo.vn`).trim().toLowerCase();
-    const isAdmin = cleanEmail === 'huynhlamtruong046@gmail.com';
-
     const inserted = await db.insert(users)
       .values({
         uid,
         email: cleanEmail,
         phoneNumber: phoneNumber || null,
-        emailVerified: isAdmin, // Admin is pre-verified
+        emailVerified: false, // Set to true only after verifying a Firebase ID token
         isCompleted: false,
       })
       .returning();
@@ -313,6 +317,10 @@ export async function getCandidatesForUser(userId: string, filters?: FilterState
       .where(eq(swipes.swiperId, userId));
     const swipedIds = swipedRows.map(r => r.targetId);
     swipedIds.push(userId); // exclude self
+    const blockedRows = await db.select({ reportedId: reports.reportedId })
+      .from(reports)
+      .where(and(eq(reports.reporterId, userId), eq(reports.type, 'BLOCK')));
+    const blockedIds = new Set(blockedRows.map((row) => row.reportedId));
 
     // 2. Fetch verified and completed users from SQL database
     const verifiedUsers = await db.select({ uid: users.uid })
@@ -324,7 +332,7 @@ export async function getCandidatesForUser(userId: string, filters?: FilterState
 
     // Filter out swiped, self, and unverified accounts
     let candidates = allDbProfiles
-      .filter(p => !swipedIds.includes(p.userId) && verifiedUserIds.has(p.userId))
+      .filter(p => !swipedIds.includes(p.userId) && !blockedIds.has(p.userId) && verifiedUserIds.has(p.userId))
       .map(p => toAppProfile(p));
 
     // Apply filtering if provided
@@ -373,44 +381,59 @@ export async function getMatchById(matchId: string) {
 // Swiping & Matching Logic
 export async function recordSwipe(swiperId: string, targetId: string, action: SwipeAction) {
   try {
-    // Record the swipe in SQL
-    await db.insert(swipes).values({
-      swiperId,
-      targetId,
-      action,
-    });
+    if (!['LIKE', 'PASS', 'SUPER_LIKE'].includes(action)) {
+      throw new Error('Invalid swipe action');
+    }
+
+    // Update an existing swipe rather than creating duplicates on client retries.
+    const priorSwipe = await db.select().from(swipes)
+      .where(and(eq(swipes.swiperId, swiperId), eq(swipes.targetId, targetId)))
+      .limit(1);
+    if (priorSwipe.length > 0) {
+      await db.update(swipes)
+        .set({ action, createdAt: new Date() })
+        .where(eq(swipes.id, priorSwipe[0].id));
+    } else {
+      await db.insert(swipes).values({ swiperId, targetId, action });
+    }
 
     let isMatch = false;
     let matchId = '';
 
-    // Check for match on LIKE or SUPER_LIKE
     if (action === 'LIKE' || action === 'SUPER_LIKE') {
-      const targetSwipe = await db.select()
-        .from(swipes)
-        .where(
-          and(
-            eq(swipes.swiperId, targetId),
-            eq(swipes.targetId, swiperId),
-            or(eq(swipes.action, 'LIKE'), eq(swipes.action, 'SUPER_LIKE'))
-          )
-        )
+      const targetSwipe = await db.select().from(swipes)
+        .where(and(
+          eq(swipes.swiperId, targetId),
+          eq(swipes.targetId, swiperId),
+          or(eq(swipes.action, 'LIKE'), eq(swipes.action, 'SUPER_LIKE'))
+        ))
         .limit(1);
 
       if (targetSwipe.length > 0) {
-        isMatch = true;
-        matchId = `match_${Math.min(Number(swiperId) || 0, Number(targetId) || 0)}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        
-        // Insert Match in SQL database
-        await db.insert(matches).values({
-          id: matchId,
-          user1Id: swiperId,
-          user2Id: targetId,
-          matchedAt: new Date(),
-          lastMessage: action === 'SUPER_LIKE' ? '✨ Đã gửi Super Like!' : '🎉 Hai bạn đã tương hợp!',
-          lastMessageTime: new Date(),
-          unreadCountUser1: 0,
-          unreadCountUser2: 0,
-        });
+        const existingMatch = await db.select().from(matches)
+          .where(or(
+            and(eq(matches.user1Id, swiperId), eq(matches.user2Id, targetId)),
+            and(eq(matches.user1Id, targetId), eq(matches.user2Id, swiperId))
+          ))
+          .limit(1);
+        if (existingMatch.length > 0) {
+          isMatch = true;
+          matchId = existingMatch[0].id;
+        } else {
+          isMatch = true;
+          matchId = `match_${cryptoRandomId()}`;
+          const now = new Date();
+          await db.insert(matches).values({
+            id: matchId,
+            user1Id: swiperId,
+            user2Id: targetId,
+            matchedAt: now,
+            lastMessage: action === 'SUPER_LIKE' ? '✨ Đã gửi Super Like!' : '🎉 Hai bạn đã tương hợp!',
+            lastMessageTime: now,
+            unreadCountUser1: 0,
+            unreadCountUser2: 0,
+          });
+        }
       }
     }
 
@@ -509,7 +532,7 @@ export async function getMessagesForMatch(matchId: string) {
       type: r.type as 'TEXT' | 'IMAGE',
       imageUrl: r.imageUrl || undefined,
       isRead: r.isRead,
-      status: (r.isRead ? 'read' : 'delivered') as 'sending' | 'sent' | 'delivered' | 'read',
+      status: (r.isRead ? 'read' : 'sent') as 'sending' | 'sent' | 'delivered' | 'read',
       sentAt: r.sentAt.toISOString(),
     }));
   } catch (error) {
@@ -526,7 +549,7 @@ export async function createMessage(
   imageUrl?: string
 ) {
   try {
-    const msgId = `msg_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const msgId = `msg_${randomUUID()}`;
     const now = new Date();
 
     const inserted = await db.insert(messages).values({
@@ -574,7 +597,7 @@ export async function markMessagesAsRead(matchId: string, readerId: string) {
     return true;
   } catch (error) {
     console.error('Failed to mark messages as read:', error);
-    return false;
+    throw new Error('Database mark messages read failed', { cause: error });
   }
 }
 
