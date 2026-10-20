@@ -5,6 +5,12 @@ export const users = pgTable('users', {
   id: serial('id').primaryKey(),
   uid: text('uid').notNull().unique(), // Firebase UID or unique user identifier
   email: text('email').notNull(),
+  passwordHash: text('password_hash'),
+  emailVerified: boolean('email_verified').default(false).notNull(),
+  verificationCodeHash: text('verification_code_hash'),
+  verificationCodeExpiresAt: timestamp('verification_code_expires_at'),
+  verificationAttempts: integer('verification_attempts').default(0).notNull(),
+  lastVerificationSentAt: timestamp('last_verification_sent_at'),
   phoneNumber: text('phone_number'),
   isPremium: boolean('is_premium').default(false).notNull(),
   premiumTier: text('premium_tier'),

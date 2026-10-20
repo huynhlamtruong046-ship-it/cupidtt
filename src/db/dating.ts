@@ -71,6 +71,113 @@ export async function seedInitialDataIfEmpty() {
 }
 
 // User operations
+export async function getUserByEmail(email: string) {
+  try {
+    const rows = await db.select().from(users).where(eq(users.email, email.trim().toLowerCase())).limit(1);
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Failed to get user by email:', error);
+    return null;
+  }
+}
+
+export async function getUserByUid(uid: string) {
+  try {
+    const rows = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Failed to get user by uid:', error);
+    return null;
+  }
+}
+
+export async function createUserWithPassword(
+  uid: string,
+  email: string,
+  passwordHash: string,
+  verificationCodeHash?: string,
+  verificationCodeExpiresAt?: Date
+) {
+  try {
+    const cleanEmail = email.trim().toLowerCase();
+    const inserted = await db.insert(users)
+      .values({
+        uid,
+        email: cleanEmail,
+        passwordHash,
+        emailVerified: false,
+        verificationCodeHash: verificationCodeHash || null,
+        verificationCodeExpiresAt: verificationCodeExpiresAt || null,
+        verificationAttempts: 0,
+        lastVerificationSentAt: new Date(),
+        isCompleted: false,
+      })
+      .returning();
+    return inserted[0];
+  } catch (error) {
+    console.error('Failed to create user with password:', error);
+    throw new Error('Database create user failed', { cause: error });
+  }
+}
+
+export async function updateUserVerificationOtp(
+  uid: string,
+  verificationCodeHash: string,
+  verificationCodeExpiresAt: Date
+) {
+  try {
+    const updated = await db.update(users)
+      .set({
+        verificationCodeHash,
+        verificationCodeExpiresAt,
+        verificationAttempts: 0,
+        lastVerificationSentAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .where(eq(users.uid, uid))
+      .returning();
+    return updated[0];
+  } catch (error) {
+    console.error('Failed to update verification OTP:', error);
+    throw new Error('Database update OTP failed', { cause: error });
+  }
+}
+
+export async function markUserEmailVerified(uid: string) {
+  try {
+    const updated = await db.update(users)
+      .set({
+        emailVerified: true,
+        verificationCodeHash: null,
+        verificationCodeExpiresAt: null,
+        verificationAttempts: 0,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.uid, uid))
+      .returning();
+    return updated[0];
+  } catch (error) {
+    console.error('Failed to mark email verified:', error);
+    throw new Error('Database mark verified failed', { cause: error });
+  }
+}
+
+export async function incrementVerificationAttempts(uid: string) {
+  try {
+    const updated = await db.update(users)
+      .set({
+        verificationAttempts: sql`${users.verificationAttempts} + 1`,
+        updatedAt: new Date(),
+      })
+      .where(eq(users.uid, uid))
+      .returning();
+    return updated[0];
+  } catch (error) {
+    console.error('Failed to increment attempts:', error);
+    return null;
+  }
+}
+
 export async function getOrCreateUser(uid: string, email: string, phoneNumber?: string) {
   try {
     const existing = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
@@ -78,11 +185,15 @@ export async function getOrCreateUser(uid: string, email: string, phoneNumber?: 
       return existing[0];
     }
 
+    const cleanEmail = (email || `${uid}@cupidgo.vn`).trim().toLowerCase();
+    const isAdmin = cleanEmail === 'huynhlamtruong046@gmail.com';
+
     const inserted = await db.insert(users)
       .values({
         uid,
-        email: email || `${uid}@cupidgo.vn`,
+        email: cleanEmail,
         phoneNumber: phoneNumber || null,
+        emailVerified: isAdmin, // Admin is pre-verified
         isCompleted: false,
       })
       .returning();
@@ -122,16 +233,33 @@ export async function getProfileByUserId(userId: string) {
   }
 }
 
+function computeAgeFromBirthDate(birthDateStr: string): number {
+  const birth = new Date(birthDateStr);
+  if (isNaN(birth.getTime())) return 0;
+  const today = new Date();
+  let age = today.getFullYear() - birth.getFullYear();
+  const m = today.getMonth() - birth.getMonth();
+  if (m < 0 || (m === 0 && today.getDate() < birth.getDate())) {
+    age--;
+  }
+  return age;
+}
+
 export async function upsertProfile(userId: string, data: Partial<Profile>) {
   try {
     const existing = await db.select().from(profiles).where(eq(profiles.userId, userId)).limit(1);
+
+    const calculatedAge = data.birthDate ? computeAgeFromBirthDate(data.birthDate) : (data.age || 22);
+    if (calculatedAge < 18) {
+      throw new Error('Bạn phải từ đủ 18 tuổi để tham gia hẹn hò trên CupidGo.');
+    }
 
     const values = {
       userId,
       displayName: data.displayName || 'Người dùng CupidGo',
       gender: data.gender || 'OTHER',
       birthDate: data.birthDate || '2000-01-01',
-      age: data.age || 24,
+      age: calculatedAge,
       bio: data.bio ?? '',
       photos: JSON.stringify(data.photos || []),
       locationName: data.locationName || 'TP. Hồ Chí Minh',
@@ -172,11 +300,11 @@ export async function upsertProfile(userId: string, data: Partial<Profile>) {
     return await getProfileByUserId(userId);
   } catch (error) {
     console.error('Failed to upsert profile:', error);
-    throw new Error('Database save profile failed', { cause: error });
+    throw new Error(error instanceof Error ? error.message : 'Database save profile failed', { cause: error });
   }
 }
 
-// Discovery Candidates: Real people registered in SQL database!
+// Discovery Candidates: Real people registered in SQL database who are verified & completed!
 export async function getCandidatesForUser(userId: string, filters?: FilterState) {
   try {
     // 1. Get IDs already swiped by this user
@@ -186,12 +314,17 @@ export async function getCandidatesForUser(userId: string, filters?: FilterState
     const swipedIds = swipedRows.map(r => r.targetId);
     swipedIds.push(userId); // exclude self
 
-    // 2. Fetch candidates from SQL database
+    // 2. Fetch verified and completed users from SQL database
+    const verifiedUsers = await db.select({ uid: users.uid })
+      .from(users)
+      .where(and(eq(users.emailVerified, true), eq(users.isCompleted, true)));
+    const verifiedUserIds = new Set(verifiedUsers.map(u => u.uid));
+
     const allDbProfiles = await db.select().from(profiles).where(eq(profiles.isBanned, false));
 
-    // Filter out swiped & self
+    // Filter out swiped, self, and unverified accounts
     let candidates = allDbProfiles
-      .filter(p => !swipedIds.includes(p.userId))
+      .filter(p => !swipedIds.includes(p.userId) && verifiedUserIds.has(p.userId))
       .map(p => toAppProfile(p));
 
     // Apply filtering if provided
@@ -224,6 +357,16 @@ export async function getCandidatesForUser(userId: string, filters?: FilterState
   } catch (error) {
     console.error('Failed to get candidates:', error);
     throw new Error('Database candidates query failed', { cause: error });
+  }
+}
+
+export async function getMatchById(matchId: string) {
+  try {
+    const rows = await db.select().from(matches).where(eq(matches.id, matchId)).limit(1);
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Failed to get match by id:', error);
+    return null;
   }
 }
 
@@ -263,21 +406,10 @@ export async function recordSwipe(swiperId: string, targetId: string, action: Sw
           user1Id: swiperId,
           user2Id: targetId,
           matchedAt: new Date(),
-          lastMessage: action === 'SUPER_LIKE' ? '✨ Đã gửi Super Like cho bạn!' : '🎉 Hai bạn đã tương hợp!',
+          lastMessage: action === 'SUPER_LIKE' ? '✨ Đã gửi Super Like!' : '🎉 Hai bạn đã tương hợp!',
           lastMessageTime: new Date(),
           unreadCountUser1: 0,
-          unreadCountUser2: 1,
-        });
-
-        // Add automated welcome message
-        await db.insert(messages).values({
-          id: `msg_${Date.now()}_welcome`,
-          matchId: matchId,
-          senderId: targetId,
-          content: 'Chào bạn! Rất vui được tương hợp cùng bạn trên CupidGo ✨',
-          type: 'TEXT',
-          isRead: false,
-          sentAt: new Date(),
+          unreadCountUser2: 0,
         });
       }
     }
@@ -286,6 +418,17 @@ export async function recordSwipe(swiperId: string, targetId: string, action: Sw
   } catch (error) {
     console.error('Failed to record swipe:', error);
     throw new Error('Database swipe failed', { cause: error });
+  }
+}
+
+// Reset swipes for a user (allowing them to rediscover profiles without affecting personal data)
+export async function resetSwipesForUser(userId: string) {
+  try {
+    await db.delete(swipes).where(eq(swipes.swiperId, userId));
+    return { success: true };
+  } catch (error) {
+    console.error('Failed to reset swipes for user:', error);
+    throw new Error('Database reset swipes failed', { cause: error });
   }
 }
 
@@ -623,6 +766,355 @@ export async function getAdminStats() {
       totalMatches: 0,
       pendingReports: 0,
       estimatedRevenue: 0,
+    };
+  }
+}
+
+// -------------------------------------------------------------
+// DATA MANAGEMENT (Direct Cloud SQL PostgreSQL Queries)
+// -------------------------------------------------------------
+
+export async function getDataManagementMetrics() {
+  try {
+    const [
+      totalUsersRes,
+      totalProfilesRes,
+      activeProfilesRes,
+      bannedProfilesRes,
+      verifiedProfilesRes,
+      premiumUsersRes,
+      completedProfilesRes,
+      swipesRes,
+      matchesRes,
+      messagesRes,
+      latestUserUpdate,
+      latestProfileUpdate,
+    ] = await Promise.all([
+      db.select({ count: sql<number>`count(*)` }).from(users),
+      db.select({ count: sql<number>`count(*)` }).from(profiles),
+      db.select({ count: sql<number>`count(*)` }).from(profiles).where(eq(profiles.isBanned, false)),
+      db.select({ count: sql<number>`count(*)` }).from(profiles).where(eq(profiles.isBanned, true)),
+      db.select({ count: sql<number>`count(*)` }).from(profiles).where(eq(profiles.isVerified, true)),
+      db.select({ count: sql<number>`count(*)` }).from(users).where(eq(users.isPremium, true)),
+      db.select({ count: sql<number>`count(*)` }).from(profiles).where(
+        sql`${profiles.bio} IS NOT NULL AND ${profiles.bio} != '' AND ${profiles.photos} IS NOT NULL AND ${profiles.photos} != '[]'`
+      ),
+      db.select({ count: sql<number>`count(*)` }).from(swipes),
+      db.select({ count: sql<number>`count(*)` }).from(matches),
+      db.select({ count: sql<number>`count(*)` }).from(messages),
+      db.select({ latest: sql<Date | null>`max(${users.updatedAt})` }).from(users),
+      db.select({ latest: sql<Date | null>`max(${profiles.updatedAt})` }).from(profiles),
+    ]);
+
+    const totalAccounts = Number(totalUsersRes[0]?.count || 0);
+    const totalProfiles = Number(totalProfilesRes[0]?.count || 0);
+    const completedProfiles = Number(completedProfilesRes[0]?.count || 0);
+    const incompleteProfiles = Math.max(0, totalAccounts - completedProfiles);
+    const activeProfiles = Number(activeProfilesRes[0]?.count || 0);
+    const bannedProfiles = Number(bannedProfilesRes[0]?.count || 0);
+    const verifiedProfiles = Number(verifiedProfilesRes[0]?.count || 0);
+    const premiumAccounts = Number(premiumUsersRes[0]?.count || 0);
+
+    const userDate = latestUserUpdate[0]?.latest ? new Date(latestUserUpdate[0].latest) : null;
+    const profileDate = latestProfileUpdate[0]?.latest ? new Date(latestProfileUpdate[0].latest) : null;
+    let lastUpdated: Date | null = null;
+    if (userDate && profileDate) {
+      lastUpdated = userDate > profileDate ? userDate : profileDate;
+    } else {
+      lastUpdated = userDate || profileDate;
+    }
+
+    return {
+      totalAccounts,
+      totalProfiles,
+      completedProfiles,
+      incompleteProfiles,
+      activeProfiles,
+      bannedProfiles,
+      verifiedProfiles,
+      premiumAccounts,
+      totalSwipes: Number(swipesRes[0]?.count || 0),
+      totalMatches: Number(matchesRes[0]?.count || 0),
+      totalMessages: Number(messagesRes[0]?.count || 0),
+      lastUpdated: lastUpdated ? lastUpdated.toISOString() : null,
+      serverTime: new Date().toISOString(),
+    };
+  } catch (error) {
+    console.error('Failed to get data management metrics:', error);
+    throw new Error('Database get metrics failed', { cause: error });
+  }
+}
+
+export interface DataManagementUserQuery {
+  page?: number;
+  limit?: number;
+  search?: string;
+  status?: 'ALL' | 'ACTIVE' | 'BANNED' | 'VERIFIED' | 'VIP' | 'COMPLETED' | 'INCOMPLETE' | 'NO_PROFILE';
+}
+
+export async function getDataManagementUsers(query: DataManagementUserQuery) {
+  try {
+    const page = Math.max(1, Number(query.page) || 1);
+    const limit = Math.min(100, Math.max(1, Number(query.limit) || 20));
+    const offset = (page - 1) * limit;
+    const search = query.search ? query.search.trim().toLowerCase() : '';
+    const status = query.status || 'ALL';
+
+    let baseSql = sql`
+      FROM ${users} u
+      LEFT JOIN ${profiles} p ON u.uid = p.user_id
+      WHERE 1=1
+    `;
+
+    if (search) {
+      const searchParam = `%${search}%`;
+      baseSql = sql`${baseSql} AND (
+        LOWER(u.uid) LIKE ${searchParam} OR
+        LOWER(u.email) LIKE ${searchParam} OR
+        LOWER(COALESCE(p.display_name, '')) LIKE ${searchParam}
+      )`;
+    }
+
+    if (status === 'ACTIVE') {
+      baseSql = sql`${baseSql} AND (p.is_banned = FALSE OR p.is_banned IS NULL)`;
+    } else if (status === 'BANNED') {
+      baseSql = sql`${baseSql} AND p.is_banned = TRUE`;
+    } else if (status === 'VERIFIED') {
+      baseSql = sql`${baseSql} AND p.is_verified = TRUE`;
+    } else if (status === 'VIP') {
+      baseSql = sql`${baseSql} AND u.is_premium = TRUE`;
+    } else if (status === 'COMPLETED') {
+      baseSql = sql`${baseSql} AND (p.bio IS NOT NULL AND p.bio != '' AND p.photos IS NOT NULL AND p.photos != '[]')`;
+    } else if (status === 'INCOMPLETE') {
+      baseSql = sql`${baseSql} AND (p.id IS NULL OR p.bio IS NULL OR p.bio = '' OR p.photos IS NULL OR p.photos = '[]')`;
+    } else if (status === 'NO_PROFILE') {
+      baseSql = sql`${baseSql} AND p.id IS NULL`;
+    }
+
+    // Count total rows
+    const countQuery = sql`SELECT COUNT(*) as count ${baseSql}`;
+    const countRes: any = await db.execute(countQuery);
+    const totalCount = Number(countRes.rows?.[0]?.count || 0);
+
+    // Fetch paginated rows (explicit columns to avoid leaking any sensitive fields)
+    const dataQuery = sql`
+      SELECT 
+        u.id AS user_internal_id,
+        u.uid,
+        u.email,
+        u.phone_number,
+        u.is_premium,
+        u.premium_tier,
+        u.is_completed,
+        u.created_at AS user_created_at,
+        u.updated_at AS user_updated_at,
+        p.id AS profile_id,
+        p.display_name,
+        p.gender,
+        p.birth_date,
+        p.age,
+        p.bio,
+        p.photos,
+        p.location_name,
+        p.job_title,
+        p.company,
+        p.is_verified,
+        p.is_banned,
+        p.created_at AS profile_created_at,
+        p.updated_at AS profile_updated_at
+      ${baseSql}
+      ORDER BY u.created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+
+    const dataRes: any = await db.execute(dataQuery);
+    const rows = dataRes.rows || [];
+
+    const items = rows.map((r: any) => {
+      let photosArr: string[] = [];
+      try {
+        photosArr = r.photos ? JSON.parse(r.photos) : [];
+      } catch {
+        photosArr = r.photos ? [r.photos] : [];
+      }
+
+      const hasProfile = Boolean(r.profile_id);
+      const isComplete = hasProfile && Boolean(r.bio && r.bio.trim() !== '') && photosArr.length > 0;
+
+      return {
+        uid: r.uid,
+        email: r.email,
+        phoneNumber: r.phone_number || null,
+        isPremium: Boolean(r.is_premium),
+        premiumTier: r.premium_tier || null,
+        isCompletedFlag: Boolean(r.is_completed),
+        displayName: r.display_name || r.email?.split('@')[0] || 'Người dùng CupidGo',
+        gender: r.gender || 'OTHER',
+        age: r.age || null,
+        birthDate: r.birth_date || null,
+        bio: r.bio || '',
+        photos: photosArr,
+        avatar: photosArr[0] || null,
+        photosCount: photosArr.length,
+        locationName: r.location_name || 'Chưa cập nhật',
+        jobTitle: r.job_title || null,
+        company: r.company || null,
+        isVerified: Boolean(r.is_verified),
+        isBanned: Boolean(r.is_banned),
+        hasProfile,
+        isComplete,
+        userCreatedAt: r.user_created_at ? new Date(r.user_created_at).toISOString() : null,
+        userUpdatedAt: r.user_updated_at ? new Date(r.user_updated_at).toISOString() : null,
+        profileUpdatedAt: r.profile_updated_at ? new Date(r.profile_updated_at).toISOString() : null,
+      };
+    });
+
+    return {
+      users: items,
+      pagination: {
+        page,
+        limit,
+        total: totalCount,
+        totalPages: Math.ceil(totalCount / limit) || 1,
+      },
+    };
+  } catch (error) {
+    console.error('Failed to get data management users:', error);
+    throw new Error('Database get data management users failed', { cause: error });
+  }
+}
+
+export async function getDataManagementUserDetail(uid: string) {
+  try {
+    const userRow = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+    if (userRow.length === 0) return null;
+
+    const u = userRow[0];
+    const profileRow = await db.select().from(profiles).where(eq(profiles.userId, uid)).limit(1);
+    const p = profileRow.length > 0 ? profileRow[0] : null;
+
+    // Fetch user activity counts
+    const [swipesSentRes, swipesReceivedRes, matchesRes] = await Promise.all([
+      db.select({ count: sql<number>`count(*)` }).from(swipes).where(eq(swipes.swiperId, uid)),
+      db.select({ count: sql<number>`count(*)` }).from(swipes).where(eq(swipes.targetId, uid)),
+      db.select({ count: sql<number>`count(*)` }).from(matches).where(
+        or(eq(matches.user1Id, uid), eq(matches.user2Id, uid))
+      ),
+    ]);
+
+    let parsedPhotos: string[] = [];
+    let parsedInterests: string[] = [];
+    let parsedLifestyle: any = {};
+    let parsedPrompts: any = [];
+
+    if (p) {
+      try { parsedPhotos = JSON.parse(p.photos); } catch { parsedPhotos = p.photos ? [p.photos] : []; }
+      try { parsedInterests = JSON.parse(p.interests); } catch { parsedInterests = []; }
+      try { parsedLifestyle = JSON.parse(p.lifestyle); } catch { parsedLifestyle = {}; }
+      try { parsedPrompts = JSON.parse(p.prompts); } catch { parsedPrompts = []; }
+    }
+
+    return {
+      user: {
+        uid: u.uid,
+        email: u.email,
+        phoneNumber: u.phoneNumber,
+        isPremium: u.isPremium,
+        premiumTier: u.premiumTier,
+        premiumExpiry: u.premiumExpiry,
+        isCompleted: u.isCompleted,
+        createdAt: u.createdAt,
+        updatedAt: u.updatedAt,
+      },
+      profile: p ? {
+        id: p.id,
+        userId: p.userId,
+        displayName: p.displayName,
+        gender: p.gender,
+        birthDate: p.birthDate,
+        age: p.age,
+        bio: p.bio,
+        photos: parsedPhotos,
+        locationName: p.locationName,
+        latitude: p.latitude,
+        longitude: p.longitude,
+        targetGender: p.targetGender,
+        minAgePref: p.minAgePref,
+        maxAgePref: p.maxAgePref,
+        maxDistancePref: p.maxDistancePref,
+        interests: parsedInterests,
+        lookingFor: p.lookingFor,
+        jobTitle: p.jobTitle,
+        company: p.company,
+        education: p.education,
+        zodiac: p.zodiac,
+        heightCm: p.heightCm,
+        lifestyle: parsedLifestyle,
+        prompts: parsedPrompts,
+        compatibilityRate: p.compatibilityRate,
+        isVerified: p.isVerified,
+        isBanned: p.isBanned,
+        createdAt: p.createdAt,
+        updatedAt: p.updatedAt,
+      } : null,
+      stats: {
+        swipesSent: Number(swipesSentRes[0]?.count || 0),
+        swipesReceived: Number(swipesReceivedRes[0]?.count || 0),
+        matchesCount: Number(matchesRes[0]?.count || 0),
+      },
+    };
+  } catch (error) {
+    console.error('Failed to get data management user detail:', error);
+    throw new Error('Database get user detail failed', { cause: error });
+  }
+}
+
+export async function getDatabaseConnectionHealth() {
+  const startTime = Date.now();
+  try {
+    const healthResult: any = await db.execute(sql`
+      SELECT 
+        current_database() AS db_name,
+        version() AS pg_version,
+        NOW() AS server_timestamp
+    `);
+    const latencyMs = Date.now() - startTime;
+    const info = healthResult.rows?.[0] || {};
+
+    const [uCount, pCount, mCount, sCount] = await Promise.all([
+      db.select({ count: sql<number>`count(*)` }).from(users),
+      db.select({ count: sql<number>`count(*)` }).from(profiles),
+      db.select({ count: sql<number>`count(*)` }).from(matches),
+      db.select({ count: sql<number>`count(*)` }).from(swipes),
+    ]);
+
+    return {
+      status: 'CONNECTED',
+      databaseName: info.db_name || 'cloud_sql_development_database',
+      serverVersion: info.pg_version ? info.pg_version.split(' ')[0] : 'PostgreSQL',
+      serverTimestamp: info.server_timestamp,
+      latencyMs,
+      tableCounts: {
+        users: Number(uCount[0]?.count || 0),
+        profiles: Number(pCount[0]?.count || 0),
+        matches: Number(mCount[0]?.count || 0),
+        swipes: Number(sCount[0]?.count || 0),
+      },
+      healthy: true,
+      checkedAt: new Date().toISOString(),
+    };
+  } catch (error: any) {
+    const latencyMs = Date.now() - startTime;
+    return {
+      status: 'DISCONNECTED',
+      databaseName: 'cloud_sql_development_database',
+      serverVersion: 'Unknown',
+      serverTimestamp: null,
+      latencyMs,
+      tableCounts: {},
+      healthy: false,
+      error: error?.message || 'Database connection error',
+      checkedAt: new Date().toISOString(),
     };
   }
 }

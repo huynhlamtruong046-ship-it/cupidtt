@@ -1,6 +1,7 @@
 import React from 'react';
-import { SlidersHorizontal, Zap, Crown, Download } from 'lucide-react';
+import { SlidersHorizontal, Zap, Crown, Download, Database } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
+import { CupidLogo } from '../common/CupidLogo';
 
 export const MobileHeader: React.FC = () => {
   const {
@@ -8,6 +9,7 @@ export const MobileHeader: React.FC = () => {
     setIsFilterModalOpen,
     setIsPremiumModalOpen,
     setIsDownloadModalOpen,
+    setIsAdminMode,
     activateBoost,
     isBoostActive,
     boostTimeRemaining,
@@ -40,10 +42,8 @@ export const MobileHeader: React.FC = () => {
       {/* Zone 1: Brand title or page title */}
       <div className="flex items-center gap-2">
         {activeTab === 'discovery' ? (
-          <div className="flex items-center gap-1.5">
-            <span className="text-xl font-extrabold tracking-tight bg-gradient-to-r from-rose-500 via-pink-500 to-amber-400 bg-clip-text text-transparent">
-              CupidGo
-            </span>
+          <div className="flex items-center gap-2">
+            <CupidLogo size="sm" showWordmark={true} />
             {currentUser?.isPremium && (
               <span className="flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-bold text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded">
                 <Crown className="w-2.5 h-2.5" />
@@ -93,9 +93,18 @@ export const MobileHeader: React.FC = () => {
         <button
           onClick={() => setIsDownloadModalOpen(true)}
           title="Tải ứng dụng về máy / Cài đặt"
-          className="flex items-center justify-center w-9 h-9 rounded-lg bg-neutral-800 text-rose-400 hover:text-rose-300 hover:bg-neutral-700 transition-colors"
+          className="flex items-center justify-center w-9 h-9 rounded-lg bg-neutral-800 text-neutral-300 hover:text-white hover:bg-neutral-700 transition-colors"
         >
           <Download className="w-4 h-4" />
+        </button>
+
+        {/* Admin / Data Management Trigger */}
+        <button
+          onClick={() => setIsAdminMode(true)}
+          title="Quản lý dữ liệu Cloud SQL PostgreSQL (Admin)"
+          className="flex items-center justify-center w-9 h-9 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-400 hover:text-white hover:bg-rose-500/20 transition-all active:scale-95"
+        >
+          <Database className="w-4 h-4" />
         </button>
 
         {/* VIP Upgrade Banner trigger */}

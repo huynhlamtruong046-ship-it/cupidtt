@@ -26,11 +26,14 @@ import {
   MessageCircle,
   Clock,
   Sparkles,
+  Database,
 } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
 import { Profile, Gender } from '../../types';
 import { AddUserModal } from './AddUserModal';
 import { CardDetailSheet } from '../discovery/CardDetailSheet';
+import { DataManagement } from './DataManagement';
+import { CupidLogo } from '../common/CupidLogo';
 
 export const AdminDashboard: React.FC = () => {
   const {
@@ -49,7 +52,7 @@ export const AdminDashboard: React.FC = () => {
     showToast,
   } = useDating();
 
-  const [currentTab, setCurrentTab] = useState<'overview' | 'users' | 'moderation' | 'matches' | 'settings'>('overview');
+  const [currentTab, setCurrentTab] = useState<'data-management' | 'overview' | 'users' | 'moderation' | 'matches' | 'settings'>('data-management');
   const [searchTerm, setSearchTerm] = useState('');
   const [genderFilter, setGenderFilter] = useState<'ALL' | Gender>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'VERIFIED' | 'VIP' | 'BANNED'>('ALL');
@@ -98,17 +101,10 @@ export const AdminDashboard: React.FC = () => {
       <header className="h-14 border-b border-neutral-800 bg-neutral-900/90 backdrop-blur-md px-4 sm:px-6 flex items-center justify-between shrink-0 sticky top-0 z-30">
         {/* Zone 1: Breadcrumb Trail & Brand */}
         <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-tr from-rose-500 to-pink-500 flex items-center justify-center shadow-md">
-              <Flame className="w-4 h-4 text-white fill-white" />
-            </div>
-            <span className="font-extrabold text-base tracking-tight bg-gradient-to-r from-rose-400 via-pink-400 to-amber-300 bg-clip-text text-transparent">
-              CupidGo Admin
-            </span>
-          </div>
+          <CupidLogo size="sm" showWordmark={true} />
           <span className="text-neutral-600 hidden sm:inline">/</span>
-          <span className="text-xs font-medium text-neutral-400 hidden sm:inline">
-            Cổng Điều Hành & Quản Trị Hệ Thống
+          <span className="text-xs font-semibold text-neutral-400 hidden sm:inline">
+            Quản trị hệ thống
           </span>
           <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30 text-[10px] font-bold text-emerald-400 flex items-center gap-1.5 ml-1">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
@@ -142,6 +138,23 @@ export const AdminDashboard: React.FC = () => {
             <div className="px-3 py-2 text-[10px] font-bold text-neutral-500 uppercase tracking-wider">
               Phân hệ quản trị
             </div>
+
+            <button
+              onClick={() => setCurrentTab('data-management')}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-medium transition-colors ${
+                currentTab === 'data-management'
+                  ? 'bg-rose-500/10 text-rose-400 font-semibold border border-rose-500/30 shadow-sm'
+                  : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800/60'
+              }`}
+            >
+              <div className="flex items-center gap-2.5">
+                <Database className="w-4 h-4 shrink-0 text-rose-400" />
+                <span className="font-semibold text-neutral-100">Quản lý dữ liệu</span>
+              </div>
+              <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                SQL
+              </span>
+            </button>
 
             <button
               onClick={() => setCurrentTab('overview')}
@@ -244,10 +257,11 @@ export const AdminDashboard: React.FC = () => {
         </aside>
 
         {/* Content Viewport */}
-        <main className="flex-1 overflow-y-auto p-4 sm:p-6 bg-neutral-950">
+        <main className={`flex-1 overflow-y-auto ${currentTab === 'data-management' ? 'p-0' : 'p-4 sm:p-6'} bg-neutral-950 flex flex-col`}>
           {/* Mobile Tab Pills for Narrow screens */}
-          <div className="flex md:hidden gap-1.5 overflow-x-auto pb-3 mb-4 border-b border-neutral-800">
+          <div className="flex md:hidden gap-1.5 overflow-x-auto p-3 border-b border-neutral-800 bg-neutral-900/40 shrink-0">
             {[
+              { id: 'data-management', label: 'Quản lý dữ liệu' },
               { id: 'overview', label: 'Tổng quan' },
               { id: 'users', label: 'Người dùng' },
               { id: 'moderation', label: `Báo cáo (${adminStats.pendingReports})` },
@@ -267,6 +281,9 @@ export const AdminDashboard: React.FC = () => {
               </button>
             ))}
           </div>
+
+          {/* TAB 0: DATA MANAGEMENT (DIRECT CLOUD SQL POSTGRESQL) */}
+          {currentTab === 'data-management' && <DataManagement />}
 
           {/* TAB 1: OVERVIEW */}
           {currentTab === 'overview' && (

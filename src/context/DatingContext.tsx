@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
 import confetti from 'canvas-confetti';
 import { signInWithPopup } from 'firebase/auth';
 import { auth, googleAuthProvider } from '../lib/firebase.ts';
@@ -13,7 +13,7 @@ import {
   ReportItem,
   AdminStats,
 } from '../types/index.ts';
-import { INITIAL_MOCK_PROFILES, AUTO_REPLIES } from '../data/mockProfiles.ts';
+import { INITIAL_MOCK_PROFILES } from '../data/mockProfiles.ts';
 
 interface DatingContextType {
   currentUser: User | null;
@@ -38,10 +38,12 @@ interface DatingContextType {
   // Discovery stack & Swipes
   candidateProfiles: Profile[];
   currentCandidate: Profile | null;
+  refreshCandidates: () => Promise<void>;
   swipes: SwipeRecord[];
   swipe: (action: SwipeAction) => void;
   rewindLastSwipe: () => boolean;
   canRewind: boolean;
+  resetSwipeHistoryForCurrentUser: () => Promise<void>;
   
   // Matches & Chat
   matches: Match[];
@@ -119,42 +121,6 @@ const DEFAULT_FILTERS: FilterState = {
   maxDistance: 50,
   selectedInterests: [],
   verifiedOnly: false,
-};
-
-const DEFAULT_CURRENT_PROFILE: Profile = {
-  userId: 'user_me_001',
-  displayName: 'Đăng Khoa',
-  gender: 'MALE',
-  birthDate: '1999-05-15',
-  age: 25,
-  bio: 'Product Designer tại Sài Gòn ✨ Thích cà phê specialty, âm nhạc indie và nhiếp ảnh đường phố. Tìm một người bạn chân thành để cùng chia sẻ những điều giản dị.',
-  photos: [
-    '/src/assets/images/cupid_minh_portrait_1791186060876.jpg',
-    'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=800&q=80',
-  ],
-  locationName: 'Quận 1, TP. Hồ Chí Minh',
-  latitude: 10.7769,
-  longitude: 106.7009,
-  distanceKm: 0,
-  targetGender: 'FEMALE',
-  minAgePref: 20,
-  maxAgePref: 30,
-  maxDistancePref: 35,
-  interests: ['Cà phê', 'Thiết kế', 'Nhiếp ảnh', 'Du lịch', 'Âm nhạc', 'Board game'],
-  lookingFor: 'Người yêu lâu dài',
-  jobTitle: 'Senior Product Designer',
-  company: 'Fintech Studio',
-  education: 'ĐH Kiến Trúc TP.HCM',
-  zodiac: 'Kim Ngưu',
-  heightCm: 175,
-  lifestyle: {
-    drinking: 'Thỉnh thoảng cocktail',
-    smoking: 'Không hút thuốc',
-    exercise: 'Gym 3 lần/tuần',
-    pets: 'Yêu cún & mèo',
-  },
-  compatibilityRate: 98,
-  isVerified: true,
 };
 
 export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -278,6 +244,99 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 2800);
   };
+
+  // Real-time WebSocket connection for live messaging
+  const wsRef = useRef<WebSocket | null>(null);
+
+  useEffect(() => {
+    if (!currentUser?.id) {
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+      return;
+    }
+
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const wsUrl = `${protocol}//${window.location.host}/ws?userId=${encodeURIComponent(currentUser.id)}`;
+    let ws: WebSocket | null = null;
+    let reconnectTimeout: any = null;
+
+    const connect = () => {
+      try {
+        ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
+
+        ws.onopen = () => {
+          setIsDbConnected(true);
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === 'NEW_MESSAGE' && data.message) {
+              const msg: Message = data.message;
+              setMessages((prev) => ({
+                ...prev,
+                [msg.matchId]: [...(prev[msg.matchId] || []).filter((m) => m.id !== msg.id), msg],
+              }));
+              setMatches((prev) =>
+                prev.map((m) =>
+                  m.id === msg.matchId
+                    ? {
+                        ...m,
+                        lastMessage: msg.type === 'IMAGE' ? '📷 [Hình ảnh]' : msg.content,
+                        lastMessageTime: 'Vừa xong',
+                        unreadCount: m.id === activeChatMatchId ? 0 : (m.unreadCount || 0) + 1,
+                      }
+                    : m
+                )
+              );
+            } else if (data.type === 'MESSAGE_DELIVERED') {
+              const { messageId, matchId } = data;
+              setMessages((prev) => ({
+                ...prev,
+                [matchId]: (prev[matchId] || []).map((m) =>
+                  m.id === messageId ? { ...m, status: 'delivered' } : m
+                ),
+              }));
+            } else if (data.type === 'MESSAGES_READ') {
+              const { matchId } = data;
+              setMessages((prev) => ({
+                ...prev,
+                [matchId]: (prev[matchId] || []).map((m) =>
+                  m.senderId === currentUser.id ? { ...m, status: 'read', isRead: true } : m
+                ),
+              }));
+            }
+          } catch (e) {
+            console.warn('WS message parse error:', e);
+          }
+        };
+
+        ws.onclose = () => {
+          reconnectTimeout = setTimeout(connect, 3000);
+        };
+
+        ws.onerror = () => {
+          if (ws) ws.close();
+        };
+      } catch (e) {
+        console.warn('WebSocket connect error:', e);
+      }
+    };
+
+    connect();
+
+    return () => {
+      clearTimeout(reconnectTimeout);
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+      wsRef.current = null;
+    };
+  }, [currentUser?.id, activeChatMatchId]);
 
   // Safe helper to write to localStorage without crashing on QuotaExceededError
   const safeSetStorage = useCallback((key: string, value: any) => {
@@ -702,13 +761,38 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       }));
     }, 600);
 
-    // Send to Cloud SQL backend
+    // Find partnerId in this match for real-time routing
+    const targetMatch = matches.find((m) => m.id === matchId);
+    const partnerId = targetMatch
+      ? (targetMatch.user1Id === currentUser.id ? targetMatch.user2Id : targetMatch.user1Id)
+      : undefined;
+
+    // Send in real-time over WebSocket if open
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && partnerId) {
+      try {
+        wsRef.current.send(
+          JSON.stringify({
+            type: 'SEND_MESSAGE',
+            matchId,
+            receiverId: partnerId,
+            content,
+            messageType: type,
+            imageUrl,
+          })
+        );
+      } catch (wsErr) {
+        console.warn('WS send failed, will persist via HTTP POST:', wsErr);
+      }
+    }
+
+    // Persist message to Cloud SQL database
     try {
       await fetch(`/api/matches/${matchId}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           senderId: currentUser.id,
+          receiverId: partnerId,
           content,
           type,
           imageUrl,
@@ -716,70 +800,6 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       });
     } catch (err) {
       console.warn('Failed to save message to DB:', err);
-    }
-
-    // Auto reply simulation if chatting with a mock match
-    const targetMatch = matches.find((m) => m.id === matchId);
-    if (targetMatch) {
-      const partnerId = targetMatch.partnerProfile.userId;
-      const replies = AUTO_REPLIES[partnerId] || [
-        'Cảm ơn bạn nhé! Thật vui khi được kết nối cùng bạn ❤️',
-        'Mình vừa online nè! Rất vui được trò chuyện với bạn.',
-        'Hôm nay của bạn thế nào? ✨',
-      ];
-      const randomReply = replies[Math.floor(Math.random() * replies.length)];
-
-      // Partner reads your message first (after 1s)
-      setTimeout(() => {
-        setMessages((prev) => ({
-          ...prev,
-          [matchId]: (prev[matchId] || []).map((m) =>
-            m.senderId === currentUser.id ? { ...m, status: 'read', isRead: true } : m
-          ),
-        }));
-      }, 1000);
-
-      // Then partner sends reply (after 1.8s)
-      setTimeout(async () => {
-        const replyMsg: Message = {
-          id: `msg_reply_${Date.now()}`,
-          matchId,
-          senderId: partnerId,
-          content: randomReply,
-          type: 'TEXT',
-          isRead: true,
-          status: 'read',
-          sentAt: new Date().toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }),
-        };
-
-        setMessages((prev) => ({
-          ...prev,
-          [matchId]: [...(prev[matchId] || []), replyMsg],
-        }));
-
-        setMatches((prev) =>
-          prev.map((m) =>
-            m.id === matchId
-              ? {
-                  ...m,
-                  lastMessage: randomReply,
-                  lastMessageTime: 'Vừa xong',
-                }
-              : m
-          )
-        );
-
-        // Also persist partner reply to Cloud SQL
-        fetch(`/api/matches/${matchId}/messages`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            senderId: partnerId,
-            content: randomReply,
-            type: 'TEXT',
-          }),
-        }).catch(console.warn);
-      }, 1800);
     }
   };
 
@@ -839,24 +859,25 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   // Auth: Email Login & Sync with Cloud SQL
-  const login = async (email: string, isDemoReady = true) => {
-    const uid = isDemoReady ? 'user_me_001' : `user_${email.replace(/[^a-zA-Z0-9]/g, '_')}`;
+  const login = async (email: string) => {
+    const cleanEmail = email.trim().toLowerCase();
+    const uid = cleanEmail === 'huynhlamtruong046@gmail.com' ? 'Ak7nIqR8fpQ2eIUP3zQE790MOBH2' : `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
 
     try {
       const res = await fetch('/api/auth/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uid, email, isCompleted: isDemoReady }),
+        body: JSON.stringify({ uid, email: cleanEmail }),
       });
       const data = await res.json();
 
       const user: User = {
-        id: uid,
-        email,
-        phoneNumber: '0912345678',
-        isPremium: isDemoReady,
-        premiumTier: isDemoReady ? '3_months' : undefined,
-        isCompleted: data.profile ? true : isDemoReady,
+        id: data.user?.uid || uid,
+        email: cleanEmail,
+        phoneNumber: data.user?.phoneNumber || undefined,
+        isPremium: !!data.user?.isPremium,
+        premiumTier: data.user?.premiumTier || undefined,
+        isCompleted: !!data.profile,
         superLikesRemaining: 5,
         rewindRemaining: 5,
         createdAt: new Date().toISOString(),
@@ -865,8 +886,6 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
 
       if (data.profile) {
         setCurrentProfile(data.profile);
-      } else if (isDemoReady) {
-        setCurrentProfile(DEFAULT_CURRENT_PROFILE);
       } else {
         setCurrentProfile(null);
       }
@@ -877,18 +896,16 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       console.warn('Sync with DB failed, fallback to local login:', err);
       const user: User = {
         id: uid,
-        email,
+        email: cleanEmail,
         phoneNumber: '0912345678',
-        isPremium: isDemoReady,
-        premiumTier: isDemoReady ? '3_months' : undefined,
-        isCompleted: isDemoReady,
+        isPremium: false,
+        isCompleted: false,
         superLikesRemaining: 5,
         rewindRemaining: 5,
         createdAt: new Date().toISOString(),
       };
       setCurrentUser(user);
-      if (isDemoReady) setCurrentProfile(DEFAULT_CURRENT_PROFILE);
-      else setCurrentProfile(null);
+      setCurrentProfile(null);
     }
   };
 
@@ -929,17 +946,28 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       if (data.profile) {
         setCurrentProfile(data.profile);
       } else {
-        // If Google user has photoURL or displayName, pre-populate
-        if (fbUser.displayName || fbUser.photoURL) {
-          setCurrentProfile({
-            ...DEFAULT_CURRENT_PROFILE,
-            userId: fbUser.uid,
-            displayName: fbUser.displayName || 'Người dùng mới',
-            photos: fbUser.photoURL ? [fbUser.photoURL] : DEFAULT_CURRENT_PROFILE.photos,
-          });
-        } else {
-          setCurrentProfile(null);
-        }
+        // Real Google user pre-population without synthetic presets
+        setCurrentProfile({
+          userId: fbUser.uid,
+          displayName: fbUser.displayName || 'Người dùng mới',
+          gender: 'OTHER',
+          birthDate: '2000-01-01',
+          age: 24,
+          bio: '',
+          photos: fbUser.photoURL ? [fbUser.photoURL] : [],
+          locationName: 'Việt Nam',
+          latitude: 10.7769,
+          longitude: 106.7009,
+          distanceKm: 0,
+          interests: [],
+          targetGender: 'BOTH',
+          minAgePref: 18,
+          maxAgePref: 50,
+          maxDistancePref: 50,
+          lookingFor: 'Hẹn hò tìm hiểu',
+          compatibilityRate: 90,
+          lifestyle: {},
+        });
       }
 
       loadCandidatesFromDb(fbUser.uid);
@@ -952,10 +980,11 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
   };
 
   const register = async (email: string) => {
-    const uid = `user_${Date.now()}`;
+    const cleanEmail = email.trim().toLowerCase();
+    const uid = cleanEmail === 'huynhlamtruong046@gmail.com' ? 'Ak7nIqR8fpQ2eIUP3zQE790MOBH2' : `user_${cleanEmail.replace(/[^a-zA-Z0-9]/g, '_')}`;
     const newUser: User = {
       id: uid,
-      email,
+      email: cleanEmail,
       isPremium: false,
       isCompleted: false, // Forces onboarding flow for real info input!
       superLikesRemaining: 3,
@@ -970,7 +999,7 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
       await fetch('/api/auth/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ uid, email, isCompleted: false }),
+        body: JSON.stringify({ uid, email: cleanEmail, isCompleted: false }),
       });
     } catch {}
   };
@@ -987,9 +1016,31 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     if (!currentUser) return;
 
     const completedProfile: Profile = {
-      ...DEFAULT_CURRENT_PROFILE,
-      ...data,
       userId: currentUser.id,
+      displayName: data.displayName || 'Người dùng',
+      gender: data.gender || 'OTHER',
+      birthDate: data.birthDate || '2000-01-01',
+      age: data.age || 24,
+      bio: data.bio || '',
+      photos: data.photos && data.photos.length > 0 ? data.photos : [],
+      locationName: data.locationName || 'Việt Nam',
+      latitude: data.latitude ?? 10.7769,
+      longitude: data.longitude ?? 106.7009,
+      distanceKm: 0,
+      targetGender: data.targetGender || 'BOTH',
+      minAgePref: data.minAgePref || 18,
+      maxAgePref: data.maxAgePref || 50,
+      maxDistancePref: data.maxDistancePref || 50,
+      interests: data.interests || [],
+      lookingFor: data.lookingFor || 'Hẹn hò tìm hiểu',
+      jobTitle: data.jobTitle,
+      company: data.company,
+      education: data.education,
+      zodiac: data.zodiac,
+      heightCm: data.heightCm,
+      lifestyle: data.lifestyle || {},
+      compatibilityRate: 95,
+      isVerified: false,
     };
 
     setCurrentProfile(completedProfile);
@@ -1162,19 +1213,37 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
     showToast(`Đã thêm hồ sơ "${profile.displayName}" vào hệ thống.`);
   };
 
-  // Reset demo
-  const resetAllData = () => {
+  // Reset swipe history for current user so they can rediscover real candidate profiles without affecting their personal data
+  const resetSwipeHistoryForCurrentUser = async () => {
+    if (!currentUser) return;
     try {
-      localStorage.clear();
-    } catch {}
+      await fetch('/api/swipes/reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ swiperId: currentUser.id }),
+      });
+      setSwipes([]);
+      setSwipeHistory([]);
+      try {
+        localStorage.removeItem(STORAGE_KEYS.SWIPES);
+      } catch {}
+      await loadCandidatesFromDb(currentUser.id);
+      showToast('Đã làm mới danh sách khám phá. Bạn có thể xem lại các hồ sơ!');
+    } catch (err) {
+      console.warn('Failed to reset swipes:', err);
+      showToast('Không thể làm mới danh sách lúc này.');
+    }
+  };
+
+  // Reset local app filters & cache without overwriting the authenticated real user
+  const resetAllData = () => {
     setSwipes([]);
-    setMatches([]);
-    setMessages({});
-    setBlockedIds([]);
-    setFilters(DEFAULT_FILTERS);
     setSwipeHistory([]);
-    login('demo@cupidgo.vn', true);
-    showToast('Đã đặt lại dữ liệu ứng dụng.');
+    setFilters(DEFAULT_FILTERS);
+    if (currentUser?.id) {
+      loadCandidatesFromDb(currentUser.id);
+    }
+    showToast('Đã đặt lại bộ lọc và làm mới danh sách.');
   };
 
   return (
@@ -1198,10 +1267,14 @@ export const DatingProvider: React.FC<{ children: React.ReactNode }> = ({ childr
         adminStats,
         candidateProfiles,
         currentCandidate,
+        refreshCandidates: async () => {
+          await loadCandidatesFromDb();
+        },
         swipes,
         swipe,
         rewindLastSwipe,
         canRewind,
+        resetSwipeHistoryForCurrentUser,
         matches,
         messages,
         sendMessage,

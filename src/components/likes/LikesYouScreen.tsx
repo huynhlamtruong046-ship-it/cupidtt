@@ -33,7 +33,7 @@ export const LikesYouScreen: React.FC = () => {
   };
 
   return (
-    <div className="flex-1 flex flex-col p-4 bg-neutral-950 text-neutral-100 overflow-y-auto">
+    <div className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6 bg-neutral-950 text-neutral-100 overflow-y-auto">
       {/* Premium Teaser Banner */}
       {!isPremium ? (
         <div className="relative mb-5 p-4 rounded-2xl bg-gradient-to-r from-amber-500/20 via-rose-500/20 to-purple-500/20 border border-amber-500/30 overflow-hidden">
@@ -81,7 +81,7 @@ export const LikesYouScreen: React.FC = () => {
           </p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-3 pb-8">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 pb-8">
           {likedMeProfiles.map((profile) => (
             <div
               key={profile.userId}
