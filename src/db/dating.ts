@@ -178,22 +178,49 @@ export async function incrementVerificationAttempts(uid: string) {
   }
 }
 
-export async function getOrCreateUser(uid: string, email: string, phoneNumber?: string) {
+export async function getOrCreateUser(uid: string, email: string, phoneNumber?: string, isEmailVerified = false) {
   try {
-    const existing = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
-    if (existing.length > 0) {
-      return existing[0];
-    }
-
     const cleanEmail = (email || `${uid}@cupidgo.vn`).trim().toLowerCase();
     const isAdmin = cleanEmail === 'huynhlamtruong046@gmail.com';
 
+    // 1. Check by UID first
+    const byUid = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+    if (byUid.length > 0) {
+      if ((isEmailVerified || isAdmin) && !byUid[0].emailVerified) {
+        await db.update(users).set({ emailVerified: true, updatedAt: new Date() }).where(eq(users.uid, uid));
+        byUid[0].emailVerified = true;
+      }
+      return byUid[0];
+    }
+
+    // 2. Check by Email to unify existing records without duplicates
+    const byEmail = await db.select().from(users).where(eq(users.email, cleanEmail)).limit(1);
+    if (byEmail.length > 0) {
+      const oldUid = byEmail[0].uid;
+      const updated = await db.update(users)
+        .set({
+          uid,
+          phoneNumber: phoneNumber || byEmail[0].phoneNumber,
+          emailVerified: isEmailVerified || byEmail[0].emailVerified || isAdmin,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, byEmail[0].id))
+        .returning();
+
+      if (oldUid !== uid) {
+        // Also update profiles table to point to current Firebase UID
+        await db.update(profiles).set({ userId: uid }).where(eq(profiles.userId, oldUid));
+      }
+      return updated[0];
+    }
+
+    // 3. Insert brand new user
     const inserted = await db.insert(users)
       .values({
         uid,
         email: cleanEmail,
         phoneNumber: phoneNumber || null,
-        emailVerified: isAdmin, // Admin is pre-verified
+        emailVerified: isEmailVerified || isAdmin,
         isCompleted: false,
       })
       .returning();

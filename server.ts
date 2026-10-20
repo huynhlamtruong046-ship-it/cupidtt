@@ -44,7 +44,7 @@ import {
   getDataManagementUserDetail,
   getDatabaseConnectionHealth,
 } from './src/db/dating.ts';
-import { optionalAuth, requireAuth, requireAdmin, AuthRequest } from './src/middleware/auth.ts';
+import { optionalAuth, requireAuth, requireVerifiedUser, requireAdmin, AuthRequest } from './src/middleware/auth.ts';
 import { adminAuth } from './src/lib/firebase-admin.ts';
 import {
   generateOtpCode,
@@ -83,11 +83,31 @@ async function startServer() {
     }
   };
 
-  wss.on('connection', (ws, req) => {
+  wss.on('connection', async (ws, req) => {
     const parsedUrl = url.parse(req.url || '', true);
-    const userId = (parsedUrl.query.userId as string) || '';
+    const token = (parsedUrl.query.token as string) || '';
+    const queryUserId = (parsedUrl.query.userId as string) || '';
+    let userId = '';
+
+    if (token) {
+      try {
+        const decoded = await adminAuth.verifyIdToken(token);
+        userId = decoded.uid;
+      } catch (err) {
+        console.warn('WebSocket token verification failed:', err);
+      }
+    }
+
+    if (!userId && queryUserId) {
+      const dbUser = await getUserByUid(queryUserId);
+      if (dbUser && dbUser.emailVerified) {
+        userId = dbUser.uid;
+      }
+    }
+
     if (!userId) {
-      ws.close();
+      ws.send(JSON.stringify({ type: 'ERROR', message: 'Unauthorized: Xác thực tài khoản không hợp lệ.' }));
+      ws.close(1008, 'Unauthorized');
       return;
     }
 

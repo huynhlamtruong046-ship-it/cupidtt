@@ -17,14 +17,41 @@ export const requireAuth = async (
     return res.status(401).json({ error: 'Unauthorized: Missing token' });
   }
 
-  const token = authHeader.split('Bearer ')[1];
+  const token = authHeader.split('Bearer ')[1].trim();
   try {
     const decodedToken = await adminAuth.verifyIdToken(token);
     req.user = decodedToken;
     req.customUserId = decodedToken.uid;
     next();
   } catch (error) {
-  
+    console.error('Error verifying Firebase ID token:', error);
+    return res.status(401).json({ error: 'Unauthorized: Invalid token' });
+  }
+};
+
+export const requireVerifiedUser = async (
+  req: AuthRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized: Missing token' });
+  }
+
+  const token = authHeader.split('Bearer ')[1].trim();
+  try {
+    const decodedToken = await adminAuth.verifyIdToken(token);
+    if (!decodedToken.email_verified) {
+      return res.status(403).json({
+        error: 'EMAIL_NOT_VERIFIED',
+        message: 'Tài khoản chưa xác minh email. Vui lòng xác thực email để truy cập tính năng này.',
+      });
+    }
+    req.user = decodedToken;
+    req.customUserId = decodedToken.uid;
+    next();
+  } catch (error) {
     console.error('Error verifying Firebase ID token:', error);
     return res.status(401).json({ error: 'Unauthorized: Invalid token' });
   }
