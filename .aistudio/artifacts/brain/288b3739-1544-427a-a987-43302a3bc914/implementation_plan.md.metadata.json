@@ -1,0 +1,6 @@
+{
+  "summary": "Kế hoạch xử lý triệt để 2 lỗ hổng bảo mật nghiêm trọng: Bắt buộc xác minh email thật qua OTP/SMTP và phân quyền Quản trị viên (Admin) chặt chẽ từ máy chủ với Session Token kiểm tra cơ sở dữ liệu Cloud SQL.",
+  "updatedAt": "2026-10-19T22:28:56.507798190Z",
+  "requestFeedback": true,
+  "userFacing": true
+}
