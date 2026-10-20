@@ -22,9 +22,10 @@ import { CardDetailSheet } from '../discovery/CardDetailSheet';
 interface ChatScreenProps {
   matchId: string;
   onBack: () => void;
+  isEmbedded?: boolean;
 }
 
-export const ChatScreen: React.FC<ChatScreenProps> = ({ matchId, onBack }) => {
+export const ChatScreen: React.FC<ChatScreenProps> = ({ matchId, onBack, isEmbedded }) => {
   const {
     matches,
     messages,
@@ -96,7 +97,9 @@ export const ChatScreen: React.FC<ChatScreenProps> = ({ matchId, onBack }) => {
         <div className="flex items-center gap-2 min-w-0">
           <button
             onClick={onBack}
-            className="p-1.5 -ml-1 text-neutral-400 hover:text-white rounded-lg transition-colors"
+            className={`p-1.5 -ml-1 text-neutral-400 hover:text-white rounded-lg transition-colors ${
+              isEmbedded ? 'md:hidden' : ''
+            }`}
             aria-label="Quay lại"
           >
             <ArrowLeft className="w-5 h-5" />

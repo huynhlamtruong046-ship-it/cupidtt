@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Heart, Lock, Mail, ArrowRight, ShieldCheck, Sparkles, UserPlus, LogIn, Database } from 'lucide-react';
 import { useDating } from '../../context/DatingContext';
+import { CupidLogo } from '../common/CupidLogo';
 
 export const AuthScreen: React.FC = () => {
   const { login, loginWithGoogle, register, showToast, isDbConnected } = useDating();
@@ -57,38 +58,22 @@ export const AuthScreen: React.FC = () => {
     }
   };
 
-  const handleQuickDemoLogin = () => {
-    setIsLoading(true);
-    setTimeout(() => {
-      setIsLoading(false);
-      login('khoa.nguyen@cupidgo.vn', true);
-      showToast('Đã đăng nhập tài khoản Đăng Khoa (VIP)');
-    }, 400);
-  };
-
   const handleQuickNewUser = () => {
     setIsLoading(true);
     setTimeout(() => {
       setIsLoading(false);
       register(`nguoidung_${Math.floor(Math.random() * 900 + 100)}@gmail.com`);
-      showToast('Bắt đầu quy trình tạo hồ sơ người thật');
+      showToast('Bắt đầu quy trình tạo tài khoản người dùng thật');
     }, 300);
   };
 
   return (
     <div className="flex flex-col min-h-full justify-between p-6 bg-gradient-to-b from-neutral-950 via-neutral-900 to-neutral-950 text-neutral-100 overflow-y-auto">
-      {/* Brand Header */}
-      <div className="pt-6 pb-2 text-center">
-        <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-gradient-to-tr from-rose-600 via-pink-500 to-amber-400 p-0.5 shadow-xl shadow-rose-500/20 mb-3 animate-in fade-in zoom-in duration-300">
-          <div className="w-full h-full bg-neutral-950 rounded-[14px] flex items-center justify-center">
-            <Heart className="w-7 h-7 text-rose-500 fill-rose-500" />
-          </div>
-        </div>
-        <h1 className="text-3xl font-extrabold tracking-tight bg-gradient-to-r from-rose-400 via-pink-400 to-amber-300 bg-clip-text text-transparent">
-          CupidGo
-        </h1>
+      {/* Brand Header: Hình 1 Logo chính */}
+      <div className="pt-4 pb-4 flex flex-col items-center text-center">
+        <CupidLogo size="lg" showWordmark={true} className="mb-2" />
         <p className="text-xs text-neutral-400 mt-1 max-w-xs mx-auto">
-          Cơ sở dữ liệu đám mây PostgreSQL lưu trữ người thật 100%
+          Ứng dụng kết đôi thông minh · Người dùng thật 100%
         </p>
       </div>
 
@@ -253,30 +238,18 @@ export const AuthScreen: React.FC = () => {
           </div>
         </div>
 
-        {/* Demo Fast Logins for Testing */}
+        {/* Fast Registration for Testing */}
         <div className="space-y-2">
           <button
             type="button"
             onClick={handleQuickNewUser}
-            className="w-full py-2 px-3 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-xl text-xs font-semibold text-rose-300 flex items-center justify-between transition-colors"
+            className="w-full py-2.5 px-3 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 rounded-xl text-xs font-semibold text-rose-300 flex items-center justify-between transition-colors"
           >
             <div className="flex items-center gap-2">
               <UserPlus className="w-3.5 h-3.5 text-rose-400" />
-              <span>Tạo hồ sơ người thật mới ngay</span>
+              <span>Tạo tài khoản người dùng thật mới</span>
             </div>
             <ArrowRight className="w-3.5 h-3.5 text-rose-400" />
-          </button>
-
-          <button
-            type="button"
-            onClick={handleQuickDemoLogin}
-            className="w-full py-2 px-3 bg-neutral-800/60 hover:bg-neutral-800 border border-neutral-700/60 rounded-xl text-xs font-medium text-neutral-300 flex items-center justify-between transition-colors"
-          >
-            <div className="flex items-center gap-2">
-              <Sparkles className="w-3.5 h-3.5 text-amber-400" />
-              <span>Hồ sơ mẫu có sẵn (Đăng Khoa VIP)</span>
-            </div>
-            <ArrowRight className="w-3.5 h-3.5 text-neutral-500" />
           </button>
         </div>
       </div>
